@@ -1,2 +1,164 @@
 # data
-bamgoo data module.
+
+bamgoo data module with Mongo-like `Map` query DSL and SQL drivers.
+
+## Query DSL
+
+- compare: `$eq $ne $gt $gte $lt $lte $in $nin`
+- json/array: `$contains $overlap $elemMatch`
+- logic: `$and $or $nor $not`
+- text: `$like $ilike $regex`
+- options: `$select $sort $limit $offset $after $group $having $join $agg`
+- options: `$withCount`
+
+## Update DSL
+
+- `$set`
+- `$inc`
+- `$unset`
+- `$push`
+- `$pull`
+- `$addToSet`
+- `$setPath`
+
+## Driver Notes
+
+- `pgsql`: native support for `$contains/$overlap/$elemMatch` (json/array operators).
+- `mysql`: uses JSON functions for `$contains/$overlap/$elemMatch`.
+- `sqlite`: `$contains` fallback is string-search; `$overlap/$elemMatch` are not supported directly.
+
+## Capabilities
+
+```go
+caps, _ := data.GetCapabilities()
+fmt.Println(caps)
+// {Dialect:sqlite ILike:false Returning:false Join:true ...}
+```
+
+## Join Example
+
+```go
+rows, err := db.View("order").Query(base.Map{
+  "$select": []string{"order.id", "order.amount", "user.name"},
+  "$join": []base.Map{
+    {
+      "from": "user",
+      "alias": "user",
+      "type": "left",
+      "localField": "order.user_id",
+      "foreignField": "user.id",
+    },
+  },
+  "user.status": "active",
+  "$sort": base.Map{"order.id": 1},
+  "$limit": 20,
+})
+_ = rows
+_ = err
+```
+
+## Keyset Pagination (`$after`)
+
+```go
+page1, _ := db.Table("user").Query(base.Map{
+  "$sort": base.Map{"id": 1},
+  "$limit": 20,
+})
+
+page2, _ := db.Table("user").Query(base.Map{
+  "$sort": base.Map{"id": 1},
+  "$after": base.Map{"id": page1[len(page1)-1]["id"]},
+  "$limit": 20,
+})
+```
+
+## Aggregate Example
+
+```go
+rows, _ := db.View("order").Aggregate(base.Map{
+  "status": "paid",
+  "$group": []string{"user_id"},
+  "$agg": base.Map{
+    "total_amount": base.Map{"sum": "amount"},
+    "avg_amount":   base.Map{"avg": "amount"},
+    "cnt":          base.Map{"count": "*"},
+  },
+  "$having": base.Map{
+    "total_amount": base.Map{"$gt": 100},
+  },
+  "$sort": base.Map{"total_amount": -1},
+})
+_ = rows
+```
+
+## Page / withCount
+
+```go
+page, _ := db.Table("user").Page(0, 20, base.Map{
+  "status": "active",
+  "$sort": base.Map{"id": -1},
+  "$withCount": true,
+})
+_ = page.Total
+_ = page.Items
+```
+
+## Tx / Batch
+
+```go
+_ = db.Tx(func(tx data.DataBase) error {
+  _, err := tx.Table("user").CreateMany([]base.Map{
+    {"name": "A"},
+    {"name": "B"},
+  })
+  return err
+})
+```
+
+## Join Field Ref
+
+```go
+rows, _ := db.View("order").Query(base.Map{
+  "$join": []base.Map{
+    {"from": "user", "alias": "u", "on": base.Map{
+      "order.user_id": base.Map{"$eq": "$field:u.id"},
+    }},
+  },
+})
+_ = rows
+```
+
+## JSON/Array Example
+
+```go
+users, _ := db.Table("user").Query(base.Map{
+  "tags": base.Map{"$contains": []string{"go"}},
+  "$sort": base.Map{"id": 1},
+})
+_ = users
+```
+
+## Example
+
+```go
+db := data.Base()
+defer db.Close()
+
+item, _ := db.Table("user").Upsert(base.Map{
+  "$set": base.Map{"name": "Alice"},
+  "$inc": base.Map{"login_times": 1},
+}, base.Map{"id": 1001})
+
+_ = item
+
+rows, _ := db.View("order").Aggregate(base.Map{
+  "$group": []string{"user_id"},
+  "$agg": base.Map{
+    "total": base.Map{"sum": "amount"},
+    "cnt":   base.Map{"count": "*"},
+  },
+  "$having": base.Map{"total": base.Map{"$gt": 100}},
+})
+
+_ = rows
+```
