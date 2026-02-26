@@ -11,6 +11,28 @@ bamgoo data module with Mongo-like `Map` query DSL and SQL drivers.
 - options: `$select $sort $limit $offset $after $group $having $join $agg $withCount $unsafe`
 - options: `$withCount`
 
+## Sort Notes
+
+- Single-field sort: use `Map`
+- Multi-field sort: use `[]Map` to preserve order
+
+```go
+// single-field
+rows1 := db.Table("article").Query(base.Map{
+  "$sort": base.Map{"id": base.DESC},
+})
+_ = rows1
+
+// multi-field (ordered)
+rows2 := db.Table("article").Query(base.Map{
+  "$sort": []base.Map{
+    {"id": base.ASC},
+    {"views": base.DESC},
+  },
+})
+_ = rows2
+```
+
 ## Update DSL
 
 - `$set`
@@ -51,7 +73,7 @@ rows, err := db.View("order").Query(base.Map{
     },
   },
   "user.status": "active",
-  "$sort": base.Map{"order.id": 1},
+  "$sort": base.Map{"order.id": base.ASC},
   "$limit": 20,
 })
 _ = rows
@@ -62,12 +84,12 @@ _ = err
 
 ```go
 page1, _ := db.Table("user").Query(base.Map{
-  "$sort": base.Map{"id": 1},
+  "$sort": base.Map{"id": base.ASC},
   "$limit": 20,
 })
 
 page2, _ := db.Table("user").Query(base.Map{
-  "$sort": base.Map{"id": 1},
+  "$sort": base.Map{"id": base.ASC},
   "$after": base.Map{"id": page1[len(page1)-1]["id"]},
   "$limit": 20,
 })
@@ -87,7 +109,7 @@ rows, _ := db.View("order").Aggregate(base.Map{
   "$having": base.Map{
     "total_amount": base.Map{"$gt": 100},
   },
-  "$sort": base.Map{"total_amount": -1},
+  "$sort": base.Map{"total_amount": base.DESC},
 })
 _ = rows
 ```
@@ -97,7 +119,7 @@ _ = rows
 ```go
 page, _ := db.Table("user").Page(0, 20, base.Map{
   "status": "active",
-  "$sort": base.Map{"id": -1},
+  "$sort": base.Map{"id": base.DESC},
   "$withCount": true,
 })
 _ = page.Total
@@ -145,7 +167,7 @@ _ = rows
 ```go
 users, _ := db.Table("user").Query(base.Map{
   "tags": base.Map{"$contains": []string{"go"}},
-  "$sort": base.Map{"id": 1},
+  "$sort": base.Map{"id": base.ASC},
 })
 _ = users
 ```
