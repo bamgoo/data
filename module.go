@@ -2,7 +2,9 @@ package data
 
 import (
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/bamgoo/bamgoo"
 	. "github.com/bamgoo/base"
@@ -13,12 +15,13 @@ func init() {
 }
 
 var module = &Module{
-	configs:   make(Configs, 0),
-	drivers:   make(map[string]Driver, 0),
-	instances: make(map[string]*Instance, 0),
-	tables:    make(map[string]Table, 0),
-	views:     make(map[string]View, 0),
-	models:    make(map[string]Model, 0),
+	configs:    make(Configs, 0),
+	drivers:    make(map[string]Driver, 0),
+	instances:  make(map[string]*Instance, 0),
+	tables:     make(map[string]Table, 0),
+	views:      make(map[string]View, 0),
+	models:     make(map[string]Model, 0),
+	migrations: make(map[string]Migration, 0),
 }
 
 type (
@@ -29,12 +32,13 @@ type (
 		connected   bool
 		started     bool
 
-		configs   Configs
-		drivers   map[string]Driver
-		instances map[string]*Instance
-		tables    map[string]Table
-		views     map[string]View
-		models    map[string]Model
+		configs    Configs
+		drivers    map[string]Driver
+		instances  map[string]*Instance
+		tables     map[string]Table
+		views      map[string]View
+		models     map[string]Model
+		migrations map[string]Migration
 	}
 
 	Configs map[string]Config
@@ -42,6 +46,8 @@ type (
 		Driver  string
 		Url     string
 		Schema  string
+		Mapping bool
+		Migrate MigrateOptions
 		Setting Map
 	}
 
@@ -68,6 +74,8 @@ func (m *Module) Register(name string, value Any) {
 		m.RegisterView(name, v)
 	case Model:
 		m.RegisterModel(name, v)
+	case Migration:
+		m.RegisterMigration(name, v)
 	}
 }
 
@@ -169,7 +177,7 @@ func (m *Module) Config(global Map) {
 
 	root := Map{}
 	for key, val := range cfgMap {
-		if item, ok := val.(Map); ok && key != "setting" {
+		if item, ok := val.(Map); ok && !isDataReservedMapKey(key) {
 			m.configure(key, item)
 		} else {
 			root[key] = val
@@ -198,11 +206,92 @@ func (m *Module) configure(name string, cfg Map) {
 	if v, ok := cfg["schema"].(string); ok {
 		out.Schema = v
 	}
+	if v, ok := cfg["mapping"]; ok {
+		if vv, ok := parseBool(v); ok {
+			out.Mapping = vv
+		}
+	}
+	if v, ok := cfg["fieldMapping"]; ok {
+		if vv, ok := parseBool(v); ok {
+			out.Mapping = vv
+		}
+	}
+	if v, ok := cfg["field_mapping"]; ok {
+		if vv, ok := parseBool(v); ok {
+			out.Mapping = vv
+		}
+	}
+	if v, ok := cfg["migrate"].(Map); ok {
+		if vv, ok := v["mode"].(string); ok {
+			out.Migrate.Mode = strings.ToLower(strings.TrimSpace(vv))
+		}
+		if vv, ok := parseBool(v["dryRun"]); ok {
+			out.Migrate.DryRun = vv
+		}
+		if vv, ok := parseBool(v["diffOnly"]); ok {
+			out.Migrate.DiffOnly = vv
+		}
+		if vv, ok := parseBool(v["concurrentIndex"]); ok {
+			out.Migrate.Concurrent = vv
+		}
+		if vv, ok := parseDurationAny(v["timeout"]); ok {
+			out.Migrate.Timeout = vv
+		}
+		if vv, ok := parseDurationAny(v["lockTimeout"]); ok {
+			out.Migrate.LockTimeout = vv
+		}
+		if vv, ok := parseInt64(v["retry"]); ok {
+			out.Migrate.Retry = int(vv)
+		}
+		if vv, ok := parseDurationAny(v["retryDelay"]); ok {
+			out.Migrate.RetryDelay = vv
+		}
+		if vv, ok := parseDurationAny(v["jitter"]); ok {
+			out.Migrate.Jitter = vv
+		}
+	}
 	if v, ok := cfg["setting"].(Map); ok {
 		out.Setting = v
 	}
 
 	m.configs[name] = out
+}
+
+func isDataReservedMapKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "setting", "migrate":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseDurationAny(v Any) (time.Duration, bool) {
+	switch vv := v.(type) {
+	case string:
+		d, err := time.ParseDuration(strings.TrimSpace(vv))
+		if err != nil || d <= 0 {
+			return 0, false
+		}
+		return d, true
+	case int:
+		if vv <= 0 {
+			return 0, false
+		}
+		return time.Duration(vv) * time.Millisecond, true
+	case int64:
+		if vv <= 0 {
+			return 0, false
+		}
+		return time.Duration(vv) * time.Millisecond, true
+	case float64:
+		if vv <= 0 {
+			return 0, false
+		}
+		return time.Duration(vv) * time.Millisecond, true
+	default:
+		return 0, false
+	}
 }
 
 func (m *Module) Setup() {
@@ -222,9 +311,24 @@ func (m *Module) Setup() {
 		if cfg.Driver == "" {
 			cfg.Driver = bamgoo.DEFAULT
 		}
+		if strings.TrimSpace(cfg.Schema) == "" {
+			if schema := defaultSchemaByDriver(cfg.Driver); schema != "" {
+				cfg.Schema = schema
+			}
+		}
 		m.configs[name] = cfg
 	}
 	m.initialized = true
+}
+
+func defaultSchemaByDriver(driver string) string {
+	d := strings.ToLower(strings.TrimSpace(driver))
+	switch d {
+	case "postgresql", "postgres", "pgsql":
+		return "public"
+	default:
+		return ""
+	}
 }
 
 func (m *Module) Open() {

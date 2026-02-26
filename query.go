@@ -84,7 +84,7 @@ func (RawExpr) isExpr()    {}
 func (TrueExpr) isExpr()   {}
 
 func ParseQuery(args ...Any) (Query, error) {
-	q := Query{Filter: TrueExpr{}, WithCount: true}
+	q := Query{Filter: TrueExpr{}, WithCount: false}
 	if len(args) == 0 {
 		return q, nil
 	}

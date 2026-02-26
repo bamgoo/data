@@ -2,14 +2,22 @@
 
 bamgoo data module with Mongo-like `Map` query DSL and SQL drivers.
 
+## Naming Mapping
+
+Disabled by default. Enable in config to map `camelCase <-> snake_case` automatically.
+
+```toml
+[data]
+mapping = true
+```
+
 ## Query DSL
 
 - compare: `$eq $ne $gt $gte $lt $lte $in $nin`
 - json/array: `$contains $overlap $elemMatch`
 - logic: `$and $or $nor $not`
 - text: `$like $ilike $regex`
-- options: `$select $sort $limit $offset $after $group $having $join $agg $withCount $unsafe`
-- options: `$withCount`
+- options: `$select $sort $limit $offset $after $group $having $join $agg $unsafe`
 
 ## Sort Notes
 
@@ -114,16 +122,18 @@ rows, _ := db.View("order").Aggregate(base.Map{
 _ = rows
 ```
 
-## Page / withCount
+## Slice (total + items)
 
 ```go
-page, _ := db.Table("user").Page(0, 20, base.Map{
+total, items := db.Table("user").Slice(0, 20, base.Map{
   "status": "active",
   "$sort": base.Map{"id": base.DESC},
-  "$withCount": true,
 })
-_ = page.Total
-_ = page.Items
+if db.Error() != nil {
+  return
+}
+_ = total
+_ = items
 ```
 
 ## Tx / Batch

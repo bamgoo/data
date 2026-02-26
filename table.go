@@ -34,7 +34,7 @@ func (t *sqlTable) Create(data Map) Map {
 		if k == t.key && v == nil {
 			continue
 		}
-		keys = append(keys, d.Quote(k))
+		keys = append(keys, d.Quote(t.base.storageField(k)))
 		vals = append(vals, v)
 		placeholders = append(placeholders, d.Placeholder(len(vals)))
 	}
@@ -43,7 +43,7 @@ func (t *sqlTable) Create(data Map) Map {
 	sqlText := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", source, strings.Join(keys, ","), strings.Join(placeholders, ","))
 
 	if d.SupportsReturning() {
-		sqlText += " RETURNING " + d.Quote(t.key)
+		sqlText += " RETURNING " + d.Quote(t.base.storageField(t.key))
 		var id any
 		if err := t.base.currentExec().QueryRowContext(context.Background(), sqlText, toInterfaces(vals)...).Scan(&id); err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
@@ -136,12 +136,12 @@ func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
 	}
 	quotedCols := make([]string, 0, len(cols))
 	for _, col := range cols {
-		quotedCols = append(quotedCols, d.Quote(col))
+		quotedCols = append(quotedCols, d.Quote(t.base.storageField(col)))
 	}
 	sqlText := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", t.base.sourceExpr(t.schema, t.source), strings.Join(quotedCols, ","), strings.Join(valuesSQL, ","))
 
 	if d.SupportsReturning() {
-		sqlText += " RETURNING " + d.Quote(t.key)
+		sqlText += " RETURNING " + d.Quote(t.base.storageField(t.key))
 		rows, err := t.base.currentExec().QueryContext(context.Background(), sqlText, toInterfaces(args)...)
 		if err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
@@ -283,7 +283,7 @@ func (t *sqlTable) Remove(args ...Any) Map {
 		return nil
 	}
 	d := t.base.conn.Dialect()
-	sqlText := fmt.Sprintf("DELETE FROM %s WHERE %s = %s", t.base.sourceExpr(t.schema, t.source), d.Quote(t.key), d.Placeholder(1))
+	sqlText := fmt.Sprintf("DELETE FROM %s WHERE %s = %s", t.base.sourceExpr(t.schema, t.source), d.Quote(t.base.storageField(t.key)), d.Placeholder(1))
 	if _, err := t.base.currentExec().ExecContext(context.Background(), sqlText, item[t.key]); err != nil {
 		statsFor(t.base.inst.Name).Errors.Add(1)
 		t.base.setError(wrapErr(t.name+".remove.exec", ErrInvalidQuery, classifySQLError(err)))
@@ -301,6 +301,7 @@ func (t *sqlTable) Update(sets Map, args ...Any) int64 {
 		t.base.setError(wrapErr(t.name+".update.parse", ErrInvalidQuery, err))
 		return 0
 	}
+	q = t.mapQueryToStorage(q)
 	if t.blockUnsafeMutation(q) {
 		t.base.setError(wrapErr(t.name+".update.unsafe", ErrInvalidQuery, fmt.Errorf("unsafe update blocked, set %s=true to allow full-table update", OptUnsafe)))
 		return 0
@@ -322,6 +323,7 @@ func (t *sqlTable) Update(sets Map, args ...Any) int64 {
 	d := t.base.conn.Dialect()
 
 	builder := NewSQLBuilder(d)
+	t.bindBuilder(builder, q)
 	builder.index = len(vals) + 1
 	where, p, err := builder.CompileWhere(q)
 	if err != nil {
@@ -357,11 +359,13 @@ func (t *sqlTable) Delete(args ...Any) int64 {
 		t.base.setError(wrapErr(t.name+".delete.parse", ErrInvalidQuery, err))
 		return 0
 	}
+	q = t.mapQueryToStorage(q)
 	if t.blockUnsafeMutation(q) {
 		t.base.setError(wrapErr(t.name+".delete.unsafe", ErrInvalidQuery, fmt.Errorf("unsafe delete blocked, set %s=true to allow full-table delete", OptUnsafe)))
 		return 0
 	}
 	b := NewSQLBuilder(t.base.conn.Dialect())
+	t.bindBuilder(b, q)
 	where, params, err := b.CompileWhere(q)
 	if err != nil {
 		t.base.setError(wrapErr(t.name+".delete.where", ErrInvalidQuery, err))
@@ -390,10 +394,6 @@ func (t *sqlTable) Entity(id Any) Map {
 	return t.First(Map{t.key: id})
 }
 
-func (t *sqlTable) Page(offset, limit int64, args ...Any) PageResult {
-	return t.sqlView.Page(offset, limit, args...)
-}
-
 func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]string, []Any, error) {
 	d := t.base.conn.Dialect()
 	setPart, incPart, unsetPart, pathPart, unsetPathPart, err := t.parseUpdateData(input, current, current != nil)
@@ -416,7 +416,7 @@ func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]stri
 			continue
 		}
 		vals = append(vals, v)
-		clauses = append(clauses, d.Quote(k)+" = "+d.Placeholder(placeholderIdx))
+		clauses = append(clauses, d.Quote(t.base.storageField(k))+" = "+d.Placeholder(placeholderIdx))
 		placeholderIdx++
 	}
 
@@ -425,7 +425,7 @@ func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]stri
 			continue
 		}
 		vals = append(vals, v)
-		f := d.Quote(k)
+		f := d.Quote(t.base.storageField(k))
 		clauses = append(clauses, f+" = COALESCE("+f+",0) + "+d.Placeholder(placeholderIdx))
 		placeholderIdx++
 	}
@@ -434,7 +434,7 @@ func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]stri
 		if k == t.key {
 			continue
 		}
-		clauses = append(clauses, d.Quote(k)+" = NULL")
+		clauses = append(clauses, d.Quote(t.base.storageField(k))+" = NULL")
 	}
 
 	for path, value := range pathPart {
@@ -460,7 +460,7 @@ func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]stri
 		if err != nil {
 			return nil, nil, err
 		}
-		fieldExpr := d.Quote(field)
+		fieldExpr := d.Quote(t.base.storageField(field))
 		name := strings.ToLower(d.Name())
 		switch {
 		case name == "pgsql" || name == "postgres":
@@ -507,7 +507,7 @@ func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]stri
 		if len(segments) == 0 {
 			continue
 		}
-		fieldExpr := d.Quote(field)
+		fieldExpr := d.Quote(t.base.storageField(field))
 		name := strings.ToLower(d.Name())
 		switch {
 		case name == "pgsql" || name == "postgres":
@@ -825,7 +825,7 @@ func (t *sqlTable) upsertNative(data Map, condition Map) (Map, error) {
 	insertPH := make([]string, 0, len(keys))
 	insertVals := make([]Any, 0, len(keys))
 	for _, k := range keys {
-		insertCols = append(insertCols, d.Quote(k))
+		insertCols = append(insertCols, d.Quote(t.base.storageField(k)))
 		insertVals = append(insertVals, createVal[k])
 		insertPH = append(insertPH, d.Placeholder(len(insertVals)))
 	}
@@ -835,7 +835,7 @@ func (t *sqlTable) upsertNative(data Map, condition Map) (Map, error) {
 		if k == conflictKey {
 			continue
 		}
-		qk := d.Quote(k)
+		qk := d.Quote(t.base.storageField(k))
 		switch name {
 		case "pgsql", "postgres":
 			updateCols = append(updateCols, qk+" = EXCLUDED."+qk)
@@ -846,19 +846,20 @@ func (t *sqlTable) upsertNative(data Map, condition Map) (Map, error) {
 		}
 	}
 	if len(updateCols) == 0 {
-		updateCols = append(updateCols, d.Quote(conflictKey)+" = "+d.Quote(conflictKey))
+		ck := d.Quote(t.base.storageField(conflictKey))
+		updateCols = append(updateCols, ck+" = "+ck)
 	}
 
 	source := t.base.sourceExpr(t.schema, t.source)
 	sqlText := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", source, strings.Join(insertCols, ","), strings.Join(insertPH, ","))
 	switch name {
 	case "pgsql", "postgres":
-		sqlText += " ON CONFLICT (" + d.Quote(conflictKey) + ") DO UPDATE SET " + strings.Join(updateCols, ",")
-		sqlText += " RETURNING " + d.Quote(t.key)
+		sqlText += " ON CONFLICT (" + d.Quote(t.base.storageField(conflictKey)) + ") DO UPDATE SET " + strings.Join(updateCols, ",")
+		sqlText += " RETURNING " + d.Quote(t.base.storageField(t.key))
 	case "sqlite":
-		sqlText += " ON CONFLICT(" + d.Quote(conflictKey) + ") DO UPDATE SET " + strings.Join(updateCols, ",")
+		sqlText += " ON CONFLICT(" + d.Quote(t.base.storageField(conflictKey)) + ") DO UPDATE SET " + strings.Join(updateCols, ",")
 		if d.SupportsReturning() {
-			sqlText += " RETURNING " + d.Quote(t.key)
+			sqlText += " RETURNING " + d.Quote(t.base.storageField(t.key))
 		}
 	case "mysql":
 		sqlText += " ON DUPLICATE KEY UPDATE " + strings.Join(updateCols, ",")

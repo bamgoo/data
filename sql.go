@@ -12,6 +12,11 @@ type SQLBuilder struct {
 	dialect Dialect
 	args    []Any
 	index   int
+	// Optional resolvers for `a.b` ambiguity:
+	// alias.field vs jsonPath.
+	isAlias     func(string) bool
+	isJSONField func(string) bool
+	toStorage   func(string) string
 }
 
 func NewSQLBuilder(d Dialect) *SQLBuilder {
@@ -98,9 +103,15 @@ func (b *SQLBuilder) CompileExpr(e Expr) (string, error) {
 }
 
 func (b *SQLBuilder) compileCmp(c CmpExpr) (string, error) {
-	field := b.quoteField(c.Field)
+	field, err := b.compileFieldExpr(c.Field)
+	if err != nil {
+		return "", err
+	}
 	if ref, ok := c.Value.(FieldRef); ok {
-		rf := b.quoteField(string(ref))
+		rf, err := b.compileFieldExpr(string(ref))
+		if err != nil {
+			return "", err
+		}
 		switch c.Op {
 		case OpEq:
 			return field + " = " + rf, nil
@@ -185,6 +196,50 @@ func (b *SQLBuilder) compileCmp(c CmpExpr) (string, error) {
 		return b.compileElemMatch(field, c.Value)
 	default:
 		return "", fmt.Errorf("unsupported compare operator %s", c.Op)
+	}
+}
+
+func (b *SQLBuilder) compileFieldExpr(field string) (string, error) {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return "", fmt.Errorf("empty field")
+	}
+	if !strings.Contains(field, ".") {
+		return b.quoteField(field), nil
+	}
+	parts := strings.Split(field, ".")
+	head := strings.TrimSpace(parts[0])
+	tail := parts[1:]
+	if b.isAlias != nil && b.isAlias(head) {
+		return b.quoteField(field), nil
+	}
+	if b.isJSONField != nil && b.isJSONField(head) {
+		return b.compileJSONPathExpr(head, tail)
+	}
+	return "", fmt.Errorf("ambiguous field %s: neither alias.field nor jsonPath on JSON field", field)
+}
+
+func (b *SQLBuilder) compileJSONPathExpr(head string, path []string) (string, error) {
+	if b.toStorage != nil {
+		head = b.toStorage(head)
+	}
+	base := b.quoteField(head)
+	name := strings.ToLower(strings.TrimSpace(b.dialect.Name()))
+	if len(path) == 0 {
+		return base, nil
+	}
+	switch {
+	case name == "pgsql" || name == "postgres":
+		if len(path) == 1 {
+			return fmt.Sprintf("(%s->>'%s')", base, path[0]), nil
+		}
+		return fmt.Sprintf("(%s#>>'{%s}')", base, strings.Join(path, ",")), nil
+	case name == "mysql":
+		return fmt.Sprintf("JSON_UNQUOTE(JSON_EXTRACT(%s, '$.%s'))", base, strings.Join(path, ".")), nil
+	case name == "sqlite":
+		return fmt.Sprintf("json_extract(%s, '$.%s')", base, strings.Join(path, ".")), nil
+	default:
+		return "", fmt.Errorf("dialect %s does not support json path field %s.%s", name, head, strings.Join(path, "."))
 	}
 }
 

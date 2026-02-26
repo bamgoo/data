@@ -8,6 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,14 +21,39 @@ import (
 )
 
 type (
-	RangeFunc func(Map) Res
-	TxFunc    func(DataBase) error
+	ScanFunc func(Map) Res
+	TxFunc   func(DataBase) error
 
-	PageResult struct {
-		Offset int64 `json:"offset"`
-		Limit  int64 `json:"limit"`
-		Total  int64 `json:"total"`
-		Items  []Map `json:"items"`
+	MigrateOptions struct {
+		Mode        string
+		DryRun      bool
+		DiffOnly    bool
+		Concurrent  bool
+		Timeout     time.Duration
+		LockTimeout time.Duration
+		Retry       int
+		RetryDelay  time.Duration
+		Jitter      time.Duration
+	}
+
+	PlanOptions struct {
+		Enable   bool
+		Capacity int
+		TTL      time.Duration
+	}
+
+	MigrateAction struct {
+		Kind   string `json:"kind"`
+		Target string `json:"target"`
+		SQL    string `json:"sql,omitempty"`
+		Apply  bool   `json:"apply"`
+		Detail string `json:"detail,omitempty"`
+	}
+
+	MigrateReport struct {
+		Mode    string          `json:"mode"`
+		DryRun  bool            `json:"dryRun"`
+		Actions []MigrateAction `json:"actions"`
 	}
 
 	DataBase interface {
@@ -34,6 +63,12 @@ type (
 		Rollback() error
 		Tx(TxFunc) error
 		Migrate(...string)
+		MigratePlan(...string) MigrateReport
+		MigrateDiff(...string) MigrateReport
+		MigrateUp(...string)
+		MigrateDown(int)
+		MigrateTo(string)
+		MigrateDownTo(string)
 		Capabilities() Capabilities
 		Error() error
 		ClearError()
@@ -62,10 +97,9 @@ type (
 		Aggregate(...Any) []Map
 		First(...Any) Map
 		Query(...Any) []Map
-		Range(RangeFunc, ...Any) Res
-		LimitRange(int64, RangeFunc, ...Any) Res
-		Limit(offset, limit int64, args ...Any) (int64, []Map)
-		Page(offset, limit int64, args ...Any) PageResult
+		Scan(ScanFunc, ...Any) Res
+		ScanN(int64, ScanFunc, ...Any) Res
+		Slice(offset, limit int64, args ...Any) (int64, []Map)
 		Group(field string, args ...Any) []Map
 	}
 
@@ -74,20 +108,18 @@ type (
 		Aggregate(...Any) []Map
 		First(...Any) Map
 		Query(...Any) []Map
-		Range(RangeFunc, ...Any) Res
-		LimitRange(int64, RangeFunc, ...Any) Res
-		Limit(offset, limit int64, args ...Any) (int64, []Map)
-		Page(offset, limit int64, args ...Any) PageResult
+		Scan(ScanFunc, ...Any) Res
+		ScanN(int64, ScanFunc, ...Any) Res
+		Slice(offset, limit int64, args ...Any) (int64, []Map)
 		Group(field string, args ...Any) []Map
 	}
 
 	DataModel interface {
 		First(...Any) Map
 		Query(...Any) []Map
-		Range(RangeFunc, ...Any) Res
-		LimitRange(int64, RangeFunc, ...Any) Res
-		Limit(offset, limit int64, args ...Any) (int64, []Map)
-		Page(offset, limit int64, args ...Any) PageResult
+		Scan(ScanFunc, ...Any) Res
+		ScanN(int64, ScanFunc, ...Any) Res
+		Slice(offset, limit int64, args ...Any) (int64, []Map)
 	}
 )
 
@@ -98,6 +130,7 @@ type sqlBase struct {
 	closed bool
 	mutex  sync.RWMutex
 	err    error
+	mode   string
 }
 
 type invalidDataBase struct {
@@ -123,7 +156,7 @@ func (m *Module) Base(names ...string) DataBase {
 	if provider, ok := inst.conn.(interface{ Base(*Instance) DataBase }); ok {
 		return provider.Base(inst)
 	}
-	return &sqlBase{inst: inst, conn: inst.conn}
+	return &sqlBase{inst: inst, conn: inst.conn, mode: errorModeFromSetting(inst.Config.Setting)}
 }
 
 func (b *sqlBase) Close() error {
@@ -139,9 +172,13 @@ func (b *sqlBase) Close() error {
 }
 
 func (b *sqlBase) Error() error {
-	b.mutex.RLock()
-	defer b.mutex.RUnlock()
-	return b.err
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	err := b.err
+	if b.mode == "auto-clear" {
+		b.err = nil
+	}
+	return err
 }
 
 func (b *sqlBase) ClearError() {
@@ -153,6 +190,9 @@ func (b *sqlBase) ClearError() {
 func (b *sqlBase) setError(err error) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
+	if err == nil && b.mode == "sticky" {
+		return
+	}
 	b.err = err
 }
 
@@ -218,44 +258,723 @@ func (b *sqlBase) Capabilities() Capabilities {
 }
 
 func (b *sqlBase) Migrate(names ...string) {
-	if err := b.ensureMigrateMetaTable(); err != nil {
-		b.setError(wrapErr("migrate.meta", ErrInvalidQuery, err))
-		return
+	_, _ = b.migrateWith(names, MigrateOptions{})
+}
+
+func (b *sqlBase) MigratePlan(names ...string) MigrateReport {
+	report, _ := b.migrateWith(names, MigrateOptions{DryRun: true})
+	return report
+}
+
+func (b *sqlBase) MigrateDiff(names ...string) MigrateReport {
+	report, _ := b.migrateWith(names, MigrateOptions{DryRun: true, DiffOnly: true})
+	return report
+}
+
+func (b *sqlBase) MigrateUp(versions ...string) {
+	err := b.runVersionedUp(versions...)
+	b.setError(err)
+}
+
+func (b *sqlBase) MigrateDown(steps int) {
+	err := b.runVersionedDown(steps)
+	b.setError(err)
+}
+
+func (b *sqlBase) MigrateTo(version string) {
+	err := b.runVersionedTo(version)
+	b.setError(err)
+}
+
+func (b *sqlBase) MigrateDownTo(version string) {
+	err := b.runVersionedDownTo(version)
+	b.setError(err)
+}
+
+func (b *sqlBase) migrateWith(names []string, override MigrateOptions) (MigrateReport, error) {
+	opts := b.defaultMigrateOptions()
+	if override.Mode != "" {
+		opts.Mode = override.Mode
 	}
+	if override.DryRun {
+		opts.DryRun = true
+	}
+	if override.DiffOnly {
+		opts.DiffOnly = true
+		opts.DryRun = true
+	}
+	if override.Concurrent {
+		opts.Concurrent = true
+	}
+	if override.Timeout > 0 {
+		opts.Timeout = override.Timeout
+	}
+	if override.LockTimeout > 0 {
+		opts.LockTimeout = override.LockTimeout
+	}
+	if override.Retry > 0 {
+		opts.Retry = override.Retry
+	}
+	if override.RetryDelay > 0 {
+		opts.RetryDelay = override.RetryDelay
+	}
+	if override.Jitter > 0 {
+		opts.Jitter = override.Jitter
+	}
+	opts.Mode = normalizeMigrateMode(opts.Mode)
+
+	report := MigrateReport{
+		Mode:    opts.Mode,
+		DryRun:  opts.DryRun,
+		Actions: make([]MigrateAction, 0, 16),
+	}
+
+	deadline := time.Now().Add(opts.Timeout)
+	if opts.Timeout <= 0 {
+		deadline = time.Time{}
+	}
+
+	if !opts.DiffOnly && !opts.DryRun {
+		if err := b.migrateRetry(opts, "migrate.meta", func() error {
+			return b.ensureMigrateMetaTable()
+		}); err != nil {
+			err = wrapErr("migrate.meta", ErrInvalidQuery, err)
+			b.setError(err)
+			return report, err
+		}
+	}
+
+	unlock := func() {}
+	if !opts.DryRun {
+		u, err := b.acquireMigrateLock(opts)
+		if err != nil {
+			err = wrapErr("migrate.lock", ErrTxFailed, err)
+			b.setError(err)
+			return report, err
+		}
+		unlock = u
+	}
+	defer unlock()
+
 	targets := names
+	explicit := len(targets) > 0
 	if len(targets) == 0 {
 		targets = make([]string, 0, len(module.tables))
 		for name := range module.Tables() {
 			targets = append(targets, name)
 		}
 	}
+	sort.Strings(targets)
+
 	for _, name := range targets {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			err := wrapErr("migrate.timeout", ErrTxFailed, fmt.Errorf("migrate timeout after %s", opts.Timeout))
+			b.setError(err)
+			return report, err
+		}
 		cfg, err := module.tableConfig(b.inst.Name, name)
 		if err != nil {
+			if explicit {
+				err = wrapErr("migrate."+name, ErrInvalidQuery, err)
+				b.setError(err)
+				return report, err
+			}
 			continue
 		}
+
 		schema := pickSchema(b.inst, cfg.Schema)
 		source := pickName(name, cfg.Table)
-		sig := migrateSignature(cfg)
-		applied, err := b.migrateAlreadyApplied(name, sig)
+		actions, err := b.planTableActions(schema, source, pickKey(cfg.Key), cfg.Fields, cfg.Indexes, cfg.Setting, opts)
 		if err != nil {
-			b.setError(wrapErr("migrate."+name+".check", ErrInvalidQuery, err))
-			return
+			err = wrapErr("migrate."+name+".plan", ErrInvalidQuery, err)
+			b.setError(err)
+			return report, err
 		}
-		if applied {
-			continue
-		}
-		if err := b.migrateTable(schema, source, pickKey(cfg.Key), cfg.Fields, cfg.Indexes, cfg.Setting); err != nil {
-			b.setError(wrapErr("migrate."+name, ErrInvalidQuery, err))
-			return
-		}
-		cacheTouchTable(b.inst.Name, source)
-		if err := b.markMigrated(name, sig); err != nil {
-			b.setError(wrapErr("migrate."+name+".mark", ErrInvalidQuery, err))
-			return
+		report.Actions = append(report.Actions, actions...)
+		if !opts.DryRun {
+			if err := b.executeMigrateActions(actions, opts); err != nil {
+				err = wrapErr("migrate."+name+".apply", ErrInvalidQuery, err)
+				b.setError(err)
+				return report, err
+			}
+			cacheTouchTable(b.inst.Name, source)
+			if !opts.DiffOnly {
+				sig := migrateSignature(cfg)
+				if err := b.migrateRetry(opts, "migrate."+name+".mark", func() error { return b.markMigrated(name, sig) }); err != nil {
+					err = wrapErr("migrate."+name+".mark", ErrInvalidQuery, err)
+					b.setError(err)
+					return report, err
+				}
+			}
 		}
 	}
 	b.setError(nil)
+	return report, nil
+}
+
+func (b *sqlBase) defaultMigrateOptions() MigrateOptions {
+	opts := MigrateOptions{
+		Mode:        "safe",
+		DryRun:      false,
+		DiffOnly:    false,
+		Concurrent:  false,
+		Timeout:     5 * time.Minute,
+		LockTimeout: 30 * time.Second,
+		Retry:       2,
+		RetryDelay:  500 * time.Millisecond,
+		Jitter:      250 * time.Millisecond,
+	}
+	if b != nil && b.inst != nil {
+		if b.inst.Config.Migrate.Mode != "" {
+			opts.Mode = b.inst.Config.Migrate.Mode
+		}
+		if b.inst.Config.Migrate.DryRun {
+			opts.DryRun = true
+		}
+		if b.inst.Config.Migrate.DiffOnly {
+			opts.DiffOnly = true
+			opts.DryRun = true
+		}
+		if b.inst.Config.Migrate.Concurrent {
+			opts.Concurrent = true
+		}
+		if b.inst.Config.Migrate.Timeout > 0 {
+			opts.Timeout = b.inst.Config.Migrate.Timeout
+		}
+		if b.inst.Config.Migrate.LockTimeout > 0 {
+			opts.LockTimeout = b.inst.Config.Migrate.LockTimeout
+		}
+		if b.inst.Config.Migrate.Retry > 0 {
+			opts.Retry = b.inst.Config.Migrate.Retry
+		}
+		if b.inst.Config.Migrate.RetryDelay > 0 {
+			opts.RetryDelay = b.inst.Config.Migrate.RetryDelay
+		}
+		if b.inst.Config.Migrate.Jitter > 0 {
+			opts.Jitter = b.inst.Config.Migrate.Jitter
+		}
+	}
+	return opts
+}
+
+func normalizeMigrateMode(mode string) string {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case "safe", "strict", "danger":
+		return m
+	default:
+		return "safe"
+	}
+}
+
+func (b *sqlBase) planTableActions(schema, table, key string, fields Vars, indexes []Index, setting Map, opts MigrateOptions) ([]MigrateAction, error) {
+	actions := make([]MigrateAction, 0, 8)
+	exists, err := b.tableExists(schema, table)
+	if err != nil {
+		return nil, err
+	}
+
+	if !exists {
+		sqlText, err := b.buildCreateTableSQL(schema, table, key, fields)
+		if err != nil {
+			return nil, err
+		}
+		actions = append(actions, MigrateAction{Kind: "create_table", Target: table, SQL: sqlText, Apply: !opts.DryRun})
+	}
+
+	currentCols := map[string]struct{}{}
+	if exists {
+		currentCols, err = b.loadColumns(schema, table)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	desiredCols := make(map[string]Var, len(fields)+1)
+	for name, field := range fields {
+		desiredCols[b.storageField(name)] = field
+	}
+	dbKey := b.storageField(key)
+	if _, ok := desiredCols[dbKey]; !ok {
+		desiredCols[dbKey] = Var{Type: "int"}
+	}
+
+	applyNotNull := false
+	if setting != nil {
+		if v, ok := setting["migrateNotNullOnAdd"]; ok {
+			applyNotNull, _ = parseBool(v)
+		}
+	}
+
+	names := make([]string, 0, len(desiredCols))
+	for name := range desiredCols {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, ok := currentCols[strings.ToLower(name)]; ok {
+			continue
+		}
+		sqlText := b.buildAddColumnSQL(schema, table, name, desiredCols[name], applyNotNull)
+		actions = append(actions, MigrateAction{Kind: "add_column", Target: table + "." + name, SQL: sqlText, Apply: !opts.DryRun})
+	}
+
+	desiredIndexes := b.collectIndexes(table, indexes, setting)
+	currentIndexes, err := b.loadIndexNames(schema, table)
+	if err != nil {
+		return nil, err
+	}
+	for _, idx := range desiredIndexes {
+		if _, ok := currentIndexes[strings.ToLower(strings.TrimSpace(idx.Name))]; ok {
+			continue
+		}
+		sqlText := b.buildCreateIndexSQL(schema, table, idx, opts.Concurrent)
+		actions = append(actions, MigrateAction{Kind: "create_index", Target: idx.Name, SQL: sqlText, Apply: !opts.DryRun})
+	}
+
+	if opts.Mode == "strict" || opts.Mode == "danger" {
+		for col := range currentCols {
+			if _, ok := desiredCols[strings.ToLower(col)]; ok {
+				continue
+			}
+			if strings.EqualFold(col, dbKey) {
+				continue
+			}
+			sqlText := b.buildDropColumnSQL(schema, table, col)
+			apply := opts.Mode == "danger" && !opts.DryRun
+			detail := ""
+			if opts.Mode == "strict" {
+				detail = "strict mode reports drift only; use danger mode to apply destructive changes"
+			}
+			actions = append(actions, MigrateAction{Kind: "drop_column", Target: table + "." + col, SQL: sqlText, Apply: apply, Detail: detail})
+		}
+		keep := make(map[string]struct{}, len(desiredIndexes))
+		for _, idx := range desiredIndexes {
+			keep[strings.ToLower(strings.TrimSpace(idx.Name))] = struct{}{}
+		}
+		for idx := range currentIndexes {
+			if strings.HasPrefix(strings.ToLower(idx), "sqlite_autoindex") {
+				continue
+			}
+			if _, ok := keep[strings.ToLower(idx)]; ok {
+				continue
+			}
+			sqlText := b.buildDropIndexSQL(schema, table, idx)
+			apply := opts.Mode == "danger" && !opts.DryRun
+			detail := ""
+			if opts.Mode == "strict" {
+				detail = "strict mode reports drift only; use danger mode to apply destructive changes"
+			}
+			actions = append(actions, MigrateAction{Kind: "drop_index", Target: idx, SQL: sqlText, Apply: apply, Detail: detail})
+		}
+	}
+
+	return actions, nil
+}
+
+func (b *sqlBase) executeMigrateActions(actions []MigrateAction, opts MigrateOptions) error {
+	for _, action := range actions {
+		if !action.Apply {
+			continue
+		}
+		if strings.TrimSpace(action.SQL) == "" {
+			continue
+		}
+		err := b.migrateRetry(opts, "migrate.exec."+action.Kind, func() error {
+			_, err := b.currentExec().ExecContext(context.Background(), action.SQL)
+			return err
+		})
+		if err != nil {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate key name") || strings.Contains(msg, "duplicate column") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *sqlBase) migrateRetry(opts MigrateOptions, tag string, run func() error) error {
+	attempts := opts.Retry + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var last error
+	for i := 0; i < attempts; i++ {
+		err := run()
+		if err == nil {
+			return nil
+		}
+		last = err
+		if i >= attempts-1 || !isTransientMigrateError(err) {
+			break
+		}
+		delay := opts.RetryDelay
+		if delay <= 0 {
+			delay = 300 * time.Millisecond
+		}
+		time.Sleep(delay + b.migrateJitter(opts, i))
+	}
+	return last
+}
+
+func isTransientMigrateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "deadlock"),
+		strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "temporarily unavailable"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "too many connections"),
+		strings.Contains(msg, "database is locked"),
+		strings.Contains(msg, "lock wait"):
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *sqlBase) migrateJitter(opts MigrateOptions, salt int) time.Duration {
+	if opts.Jitter <= 0 {
+		return 0
+	}
+	base := b.inst.Name + "|" + strconv.Itoa(salt) + "|" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	h := fnvHash(base)
+	n := int64(h % uint64(opts.Jitter))
+	if n < 0 {
+		n = -n
+	}
+	return time.Duration(n)
+}
+
+func fnvHash(s string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum64()
+}
+
+func (b *sqlBase) acquireMigrateLock(opts MigrateOptions) (func(), error) {
+	// Debounce before lock compete in multi-node startup.
+	if opts.Jitter > 0 {
+		time.Sleep(b.migrateJitter(opts, 99))
+	}
+	lockTimeout := opts.LockTimeout
+	if lockTimeout <= 0 {
+		lockTimeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(lockTimeout)
+	dn := strings.ToLower(b.conn.Dialect().Name())
+	switch {
+	case dn == "pgsql" || dn == "postgres":
+		key := int64(fnvHash("bamgoo:migrate:" + b.inst.Name))
+		for {
+			var ok bool
+			err := b.currentExec().QueryRowContext(context.Background(), "SELECT pg_try_advisory_lock($1)", key).Scan(&ok)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				return func() { _, _ = b.currentExec().ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key) }, nil
+			}
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("migrate lock timeout after %s", lockTimeout)
+			}
+			time.Sleep(200*time.Millisecond + b.migrateJitter(opts, 1))
+		}
+	case strings.Contains(dn, "mysql"):
+		lockName := "bamgoo:data:migrate:" + b.inst.Name
+		for {
+			var ok int
+			err := b.currentExec().QueryRowContext(context.Background(), "SELECT GET_LOCK(?, 0)", lockName).Scan(&ok)
+			if err != nil {
+				return nil, err
+			}
+			if ok == 1 {
+				return func() { _, _ = b.currentExec().ExecContext(context.Background(), "SELECT RELEASE_LOCK(?)", lockName) }, nil
+			}
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("migrate lock timeout after %s", lockTimeout)
+			}
+			time.Sleep(200*time.Millisecond + b.migrateJitter(opts, 2))
+		}
+	default:
+		// sqlite / others: no cross-node advisory lock support.
+		return func() {}, nil
+	}
+}
+
+func (b *sqlBase) tableExists(schema, table string) (bool, error) {
+	target := b.sourceExpr(schema, table)
+	rows, err := b.currentExec().QueryContext(context.Background(), "SELECT * FROM "+target+" WHERE 1=0")
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "does not exist") || strings.Contains(msg, "no such table") || strings.Contains(msg, "unknown table") {
+			return false, nil
+		}
+		return false, err
+	}
+	_ = rows.Close()
+	return true, nil
+}
+
+func (b *sqlBase) buildCreateTableSQL(schema, table, key string, fields Vars) (string, error) {
+	d := b.conn.Dialect()
+	source := b.sourceExpr(schema, table)
+	cols := make([]string, 0, len(fields)+1)
+	if key == "" {
+		key = "id"
+	}
+	key = b.storageField(key)
+	seenKey := false
+	for name, field := range fields {
+		col := b.storageField(name)
+		sqlType := migrateType(d.Name(), field.Type)
+		def := d.Quote(col) + " " + sqlType
+		if strings.EqualFold(col, key) {
+			seenKey = true
+			if strings.Contains(strings.ToLower(d.Name()), "sqlite") {
+				def = d.Quote(col) + " INTEGER PRIMARY KEY"
+			}
+		}
+		if field.Required && !field.Nullable {
+			def += " NOT NULL"
+		}
+		def += migrateColumnExtras(d, field)
+		cols = append(cols, def)
+	}
+	if !seenKey {
+		if strings.Contains(strings.ToLower(d.Name()), "sqlite") {
+			cols = append([]string{d.Quote(key) + " INTEGER PRIMARY KEY"}, cols...)
+		} else {
+			cols = append([]string{d.Quote(key) + " BIGINT"}, cols...)
+		}
+	}
+	if !strings.Contains(strings.ToLower(d.Name()), "sqlite") {
+		cols = append(cols, "PRIMARY KEY ("+d.Quote(key)+")")
+	}
+	return "CREATE TABLE IF NOT EXISTS " + source + " (" + strings.Join(cols, ",") + ")", nil
+}
+
+func (b *sqlBase) buildAddColumnSQL(schema, table, name string, field Var, applyNotNull bool) string {
+	d := b.conn.Dialect()
+	sqlType := migrateType(d.Name(), field.Type)
+	def := d.Quote(name) + " " + sqlType
+	if applyNotNull && field.Required && !field.Nullable {
+		def += " NOT NULL"
+	}
+	def += migrateColumnExtras(d, field)
+	return "ALTER TABLE " + b.sourceExpr(schema, table) + " ADD COLUMN " + def
+}
+
+func migrateColumnExtras(d Dialect, field Var) string {
+	out := ""
+	if field.Default != nil {
+		if lit, ok := migrateDefaultLiteral(field.Default); ok {
+			out += " DEFAULT " + lit
+		}
+	}
+	if strings.TrimSpace(field.Collation) != "" {
+		out += " COLLATE " + strings.TrimSpace(field.Collation)
+	}
+	if field.Unique {
+		out += " UNIQUE"
+	}
+	if strings.TrimSpace(field.Check) != "" {
+		out += " CHECK (" + strings.TrimSpace(field.Check) + ")"
+	}
+	if strings.Contains(strings.ToLower(d.Name()), "mysql") && strings.TrimSpace(field.Comment) != "" {
+		out += " COMMENT '" + strings.ReplaceAll(field.Comment, "'", "''") + "'"
+	}
+	return out
+}
+
+func migrateDefaultLiteral(v Any) (string, bool) {
+	switch vv := v.(type) {
+	case nil:
+		return "NULL", true
+	case string:
+		return "'" + strings.ReplaceAll(vv, "'", "''") + "'", true
+	case bool:
+		if vv {
+			return "TRUE", true
+		}
+		return "FALSE", true
+	case int, int8, int16, int32, int64:
+		return fmt.Sprintf("%v", vv), true
+	case uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%v", vv), true
+	case float32, float64:
+		return fmt.Sprintf("%v", vv), true
+	case time.Time:
+		return "'" + vv.Format(time.RFC3339Nano) + "'", true
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return "", false
+		}
+		return "'" + strings.ReplaceAll(string(b), "'", "''") + "'", true
+	}
+}
+
+func (b *sqlBase) collectIndexes(table string, indexes []Index, setting Map) []Index {
+	items := make([]Index, 0, len(indexes)+2)
+	items = append(items, indexes...)
+	if setting != nil {
+		if raw, ok := setting["indexes"]; ok {
+			switch vv := raw.(type) {
+			case []Map:
+				for _, one := range vv {
+					fields := parseStringList(one["fields"])
+					if len(fields) == 0 {
+						continue
+					}
+					name, _ := one["name"].(string)
+					unique, _ := parseBool(one["unique"])
+					items = append(items, Index{Name: strings.TrimSpace(name), Fields: fields, Unique: unique})
+				}
+			case []Any:
+				for _, rawOne := range vv {
+					one, ok := rawOne.(Map)
+					if !ok {
+						continue
+					}
+					fields := parseStringList(one["fields"])
+					if len(fields) == 0 {
+						continue
+					}
+					name, _ := one["name"].(string)
+					unique, _ := parseBool(one["unique"])
+					items = append(items, Index{Name: strings.TrimSpace(name), Fields: fields, Unique: unique})
+				}
+			case Map:
+				fields := parseStringList(vv["fields"])
+				if len(fields) > 0 {
+					name, _ := vv["name"].(string)
+					unique, _ := parseBool(vv["unique"])
+					items = append(items, Index{Name: strings.TrimSpace(name), Fields: fields, Unique: unique})
+				}
+			}
+		}
+	}
+	for i := range items {
+		if strings.TrimSpace(items[i].Name) == "" {
+			items[i].Name = fmt.Sprintf("idx_%s_%d", table, i+1)
+		}
+	}
+	return items
+}
+
+func (b *sqlBase) buildCreateIndexSQL(schema, table string, idx Index, concurrent bool) string {
+	d := b.conn.Dialect()
+	parts := make([]string, 0, len(idx.Fields))
+	for _, f := range idx.Fields {
+		parts = append(parts, d.Quote(b.storageField(f)))
+	}
+	target := b.sourceExpr(schema, table)
+	sqlText := "CREATE "
+	if idx.Unique {
+		sqlText += "UNIQUE "
+	}
+	dn := strings.ToLower(d.Name())
+	if concurrent && (dn == "pgsql" || dn == "postgres") {
+		sqlText += "INDEX CONCURRENTLY IF NOT EXISTS "
+	} else {
+		sqlText += "INDEX "
+		if !strings.Contains(dn, "mysql") {
+			sqlText += "IF NOT EXISTS "
+		}
+	}
+	sqlText += d.Quote(idx.Name) + " ON " + target + " (" + strings.Join(parts, ",") + ")"
+	return sqlText
+}
+
+func (b *sqlBase) buildDropColumnSQL(schema, table, column string) string {
+	return "ALTER TABLE " + b.sourceExpr(schema, table) + " DROP COLUMN " + b.conn.Dialect().Quote(column)
+}
+
+func (b *sqlBase) buildDropIndexSQL(schema, table, name string) string {
+	dn := strings.ToLower(b.conn.Dialect().Name())
+	qn := b.conn.Dialect().Quote(name)
+	switch {
+	case dn == "pgsql" || dn == "postgres":
+		if schema != "" {
+			return "DROP INDEX IF EXISTS " + b.conn.Dialect().Quote(schema) + "." + qn
+		}
+		return "DROP INDEX IF EXISTS " + qn
+	case strings.Contains(dn, "mysql"):
+		return "DROP INDEX " + qn + " ON " + b.sourceExpr(schema, table)
+	default:
+		return "DROP INDEX IF EXISTS " + qn
+	}
+}
+
+func (b *sqlBase) loadIndexNames(schema, table string) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	dn := strings.ToLower(b.conn.Dialect().Name())
+	switch {
+	case dn == "pgsql" || dn == "postgres":
+		d := b.conn.Dialect()
+		query := "SELECT indexname FROM pg_indexes WHERE schemaname = " + d.Placeholder(1) + " AND tablename = " + d.Placeholder(2)
+		schemaName := schema
+		if schemaName == "" {
+			schemaName = "public"
+		}
+		rows, err := b.currentExec().QueryContext(context.Background(), query, schemaName, table)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return nil, err
+			}
+			out[strings.ToLower(name)] = struct{}{}
+		}
+		return out, rows.Err()
+	case strings.Contains(dn, "mysql"):
+		query := "SELECT INDEX_NAME FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? GROUP BY INDEX_NAME"
+		rows, err := b.currentExec().QueryContext(context.Background(), query, table)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return nil, err
+			}
+			out[strings.ToLower(name)] = struct{}{}
+		}
+		return out, rows.Err()
+	default:
+		rows, err := b.currentExec().QueryContext(context.Background(), "PRAGMA index_list("+strconv.Quote(table)+")")
+		if err != nil {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "no such table") {
+				return out, nil
+			}
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var seq int
+			var name string
+			var unique int
+			var origin string
+			var partial int
+			if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+				return nil, err
+			}
+			out[strings.ToLower(name)] = struct{}{}
+		}
+		return out, rows.Err()
+	}
 }
 
 func (b *sqlBase) Table(name string) DataTable {
@@ -304,6 +1023,68 @@ func pickKey(key string) string {
 		return key
 	}
 	return "id"
+}
+
+func (b *sqlBase) fieldMappingEnabled() bool {
+	return b != nil && b.inst != nil && b.inst.Config.Mapping
+}
+
+func (b *sqlBase) storageField(field string) string {
+	field = strings.TrimSpace(field)
+	if field == "" || !b.fieldMappingEnabled() {
+		return field
+	}
+	return SnakeFieldPath(field)
+}
+
+func (b *sqlBase) appField(field string) string {
+	field = strings.TrimSpace(field)
+	if field == "" || !b.fieldMappingEnabled() {
+		return field
+	}
+	return CamelFieldPath(field)
+}
+
+func (b *sqlBase) appMap(item Map) Map {
+	if item == nil || !b.fieldMappingEnabled() {
+		return item
+	}
+	out := Map{}
+	for k, v := range item {
+		if strings.HasPrefix(k, "$") {
+			out[k] = v
+			continue
+		}
+		out[b.appField(k)] = v
+	}
+	return out
+}
+
+func (b *sqlBase) appMaps(items []Map) []Map {
+	if !b.fieldMappingEnabled() || len(items) == 0 {
+		return items
+	}
+	out := make([]Map, 0, len(items))
+	for _, item := range items {
+		out = append(out, b.appMap(item))
+	}
+	return out
+}
+
+func errorModeFromSetting(setting Map) string {
+	mode := "auto-clear"
+	if setting == nil {
+		return mode
+	}
+	if raw, ok := setting["errorMode"]; ok {
+		if s, ok := raw.(string); ok {
+			v := strings.ToLower(strings.TrimSpace(s))
+			if v == "sticky" || v == "auto-clear" {
+				return v
+			}
+		}
+	}
+	return mode
 }
 
 func (b *sqlBase) sourceExpr(schema, source string) string {
@@ -464,19 +1245,22 @@ func (b *sqlBase) migrateTable(schema, table, key string, fields Vars, indexes [
 	if key == "" {
 		key = "id"
 	}
+	key = b.storageField(key)
 	seenKey := false
 	for name, field := range fields {
+		col := b.storageField(name)
 		sqlType := migrateType(d.Name(), field.Type)
-		def := d.Quote(name) + " " + sqlType
-		if strings.EqualFold(name, key) {
+		def := d.Quote(col) + " " + sqlType
+		if strings.EqualFold(col, key) {
 			seenKey = true
 			if strings.Contains(strings.ToLower(d.Name()), "sqlite") {
-				def = d.Quote(name) + " INTEGER PRIMARY KEY"
+				def = d.Quote(col) + " INTEGER PRIMARY KEY"
 			}
 		}
 		if field.Required && !field.Nullable {
 			def += " NOT NULL"
 		}
+		def += migrateColumnExtras(d, field)
 		cols = append(cols, def)
 	}
 	if !seenKey {
@@ -493,7 +1277,81 @@ func (b *sqlBase) migrateTable(schema, table, key string, fields Vars, indexes [
 	if _, err := b.currentExec().ExecContext(context.Background(), sqlText); err != nil {
 		return err
 	}
+	if err := b.migrateColumns(schema, table, key, fields, setting); err != nil {
+		return err
+	}
 	return b.migrateIndexes(schema, table, indexes, setting)
+}
+
+func (b *sqlBase) migrateColumns(schema, table, key string, fields Vars, setting Map) error {
+	exists, err := b.loadColumns(schema, table)
+	if err != nil {
+		return err
+	}
+	applyNotNull := false
+	if setting != nil {
+		if v, ok := setting["migrateNotNullOnAdd"]; ok {
+			applyNotNull, _ = parseBool(v)
+		}
+	}
+
+	merged := make(Vars, len(fields)+1)
+	for name, field := range fields {
+		merged[b.storageField(name)] = field
+	}
+	dbKey := b.storageField(key)
+	if _, ok := merged[dbKey]; !ok {
+		merged[dbKey] = Var{Type: "int"}
+	}
+
+	names := make([]string, 0, len(merged))
+	for name := range merged {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	d := b.conn.Dialect()
+	target := b.sourceExpr(schema, table)
+	for _, name := range names {
+		if _, ok := exists[strings.ToLower(name)]; ok {
+			continue
+		}
+		field := merged[name]
+		sqlType := migrateType(d.Name(), field.Type)
+		def := d.Quote(name) + " " + sqlType
+		if applyNotNull && field.Required && !field.Nullable {
+			def += " NOT NULL"
+		}
+		def += migrateColumnExtras(d, field)
+		sqlText := "ALTER TABLE " + target + " ADD COLUMN " + def
+		if _, err := b.currentExec().ExecContext(context.Background(), sqlText); err != nil {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *sqlBase) loadColumns(schema, table string) (map[string]struct{}, error) {
+	target := b.sourceExpr(schema, table)
+	rows, err := b.currentExec().QueryContext(context.Background(), "SELECT * FROM "+target+" WHERE 1=0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{}, len(cols))
+	for _, col := range cols {
+		out[strings.ToLower(col)] = struct{}{}
+	}
+	return out, nil
 }
 
 func (b *sqlBase) migrateIndexes(schema, table string, indexes []Index, setting Map) error {
@@ -554,7 +1412,7 @@ func (b *sqlBase) migrateIndexes(schema, table string, indexes []Index, setting 
 		unique := idx.Unique
 		parts := make([]string, 0, len(fields))
 		for _, f := range fields {
-			parts = append(parts, d.Quote(f))
+			parts = append(parts, d.Quote(b.storageField(f)))
 		}
 		target := b.sourceExpr(schema, table)
 		sqlText := "CREATE "
@@ -696,12 +1554,297 @@ func (b *sqlBase) markMigrated(name, signature string) error {
 	return err
 }
 
-func (b *invalidDataBase) Close() error               { return nil }
-func (b *invalidDataBase) Begin() error               { return b.err }
-func (b *invalidDataBase) Commit() error              { return b.err }
-func (b *invalidDataBase) Rollback() error            { return b.err }
-func (b *invalidDataBase) Tx(TxFunc) error            { return b.err }
-func (b *invalidDataBase) Migrate(...string)          {}
+func (b *sqlBase) runVersionedUp(versions ...string) error {
+	if err := b.ensureVersionMigrateTable(); err != nil {
+		return err
+	}
+	all := module.migrationConfigs(b.inst.Name)
+	if len(all) == 0 {
+		return nil
+	}
+	allowed := map[string]struct{}{}
+	if len(versions) > 0 {
+		for _, v := range versions {
+			allowed[strings.TrimSpace(v)] = struct{}{}
+		}
+	}
+	applied, err := b.loadVersionApplied()
+	if err != nil {
+		return err
+	}
+	opts := b.defaultMigrateOptions()
+	unlock := func() {}
+	u, err := b.acquireMigrateLock(opts)
+	if err == nil {
+		unlock = u
+	}
+	defer unlock()
+
+	for _, mg := range all {
+		if len(allowed) > 0 {
+			if _, ok := allowed[mg.Version]; !ok {
+				continue
+			}
+		}
+		if meta, ok := applied[mg.Version]; ok {
+			if meta != mg.checksum() {
+				return fmt.Errorf("migration checksum mismatch: %s", mg.Version)
+			}
+			continue
+		}
+		if mg.Up == nil {
+			return fmt.Errorf("migration up not defined: %s", mg.Version)
+		}
+		start := time.Now()
+		if err := b.Tx(func(tx DataBase) error { return mg.Up(tx) }); err != nil {
+			b.logMigrationEvent("version_up", mg.Version, mg.Name, false, time.Since(start), err)
+			return err
+		}
+		if err := b.markVersionApplied(mg); err != nil {
+			b.logMigrationEvent("version_up_mark", mg.Version, mg.Name, false, time.Since(start), err)
+			return err
+		}
+		b.logMigrationEvent("version_up", mg.Version, mg.Name, true, time.Since(start), nil)
+	}
+	return nil
+}
+
+func (b *sqlBase) runVersionedTo(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return fmt.Errorf("empty migrate target version")
+	}
+	all := module.migrationConfigs(b.inst.Name)
+	if len(all) == 0 {
+		return nil
+	}
+	versions := make([]string, 0)
+	for _, mg := range all {
+		if mg.Version <= target {
+			versions = append(versions, mg.Version)
+		}
+	}
+	return b.runVersionedUp(versions...)
+}
+
+func (b *sqlBase) runVersionedDown(steps int) error {
+	if steps <= 0 {
+		steps = 1
+	}
+	if err := b.ensureVersionMigrateTable(); err != nil {
+		return err
+	}
+	opts := b.defaultMigrateOptions()
+	unlock := func() {}
+	u, err := b.acquireMigrateLock(opts)
+	if err == nil {
+		unlock = u
+	}
+	defer unlock()
+
+	applied, err := b.loadVersionAppliedOrderedDesc()
+	if err != nil {
+		return err
+	}
+	if len(applied) == 0 {
+		return nil
+	}
+	mm := map[string]Migration{}
+	for _, mg := range module.migrationConfigs(b.inst.Name) {
+		mm[mg.Version] = mg
+	}
+	count := 0
+	for _, v := range applied {
+		if count >= steps {
+			break
+		}
+		mg, ok := mm[v]
+		if !ok {
+			return fmt.Errorf("migration version not registered: %s", v)
+		}
+		if mg.Down == nil {
+			return fmt.Errorf("migration down not defined: %s", v)
+		}
+		start := time.Now()
+		if err := b.Tx(func(tx DataBase) error { return mg.Down(tx) }); err != nil {
+			b.logMigrationEvent("version_down", mg.Version, mg.Name, false, time.Since(start), err)
+			return err
+		}
+		if err := b.unmarkVersionApplied(v); err != nil {
+			b.logMigrationEvent("version_down_unmark", mg.Version, mg.Name, false, time.Since(start), err)
+			return err
+		}
+		b.logMigrationEvent("version_down", mg.Version, mg.Name, true, time.Since(start), nil)
+		count++
+	}
+	return nil
+}
+
+func (b *sqlBase) runVersionedDownTo(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return fmt.Errorf("empty migrate down target version")
+	}
+	if err := b.ensureVersionMigrateTable(); err != nil {
+		return err
+	}
+	applied, err := b.loadVersionAppliedOrderedDesc()
+	if err != nil {
+		return err
+	}
+	steps := 0
+	for _, v := range applied {
+		if v > target {
+			steps++
+		}
+	}
+	if steps <= 0 {
+		return nil
+	}
+	return b.runVersionedDown(steps)
+}
+
+func (b *sqlBase) ensureVersionMigrateTable() error {
+	sqlText := "CREATE TABLE IF NOT EXISTS _bamgoo_migrations_v2 (version TEXT PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TIMESTAMP NOT NULL)"
+	if strings.Contains(strings.ToLower(b.conn.Dialect().Name()), "mysql") {
+		sqlText = "CREATE TABLE IF NOT EXISTS _bamgoo_migrations_v2 (`version` VARCHAR(191) PRIMARY KEY, `name` VARCHAR(255) NOT NULL, `checksum` VARCHAR(64) NOT NULL, `applied_at` TIMESTAMP NOT NULL)"
+	}
+	_, err := b.currentExec().ExecContext(context.Background(), sqlText)
+	return err
+}
+
+func (b *sqlBase) loadVersionApplied() (map[string]string, error) {
+	rows, err := b.currentExec().QueryContext(context.Background(), "SELECT version, checksum FROM _bamgoo_migrations_v2")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var v, c string
+		if err := rows.Scan(&v, &c); err != nil {
+			return nil, err
+		}
+		out[v] = c
+	}
+	return out, rows.Err()
+}
+
+func (b *sqlBase) loadVersionAppliedOrderedDesc() ([]string, error) {
+	rows, err := b.currentExec().QueryContext(context.Background(), "SELECT version FROM _bamgoo_migrations_v2 ORDER BY applied_at DESC, version DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+func (b *sqlBase) markVersionApplied(mg Migration) error {
+	now := time.Now()
+	d := strings.ToLower(b.conn.Dialect().Name())
+	c := mg.checksum()
+	if d == "pgsql" || d == "postgres" {
+		_, err := b.currentExec().ExecContext(context.Background(),
+			"INSERT INTO _bamgoo_migrations_v2(version,name,checksum,applied_at) VALUES($1,$2,$3,$4) ON CONFLICT(version) DO UPDATE SET name=EXCLUDED.name, checksum=EXCLUDED.checksum, applied_at=EXCLUDED.applied_at",
+			mg.Version, mg.Name, c, now)
+		return err
+	}
+	if d == "sqlite" {
+		_, err := b.currentExec().ExecContext(context.Background(),
+			"INSERT INTO _bamgoo_migrations_v2(version,name,checksum,applied_at) VALUES(?,?,?,?) ON CONFLICT(version) DO UPDATE SET name=excluded.name, checksum=excluded.checksum, applied_at=excluded.applied_at",
+			mg.Version, mg.Name, c, now)
+		return err
+	}
+	_, err := b.currentExec().ExecContext(context.Background(),
+		"INSERT INTO _bamgoo_migrations_v2(version,name,checksum,applied_at) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name), checksum=VALUES(checksum), applied_at=VALUES(applied_at)",
+		mg.Version, mg.Name, c, now)
+	return err
+}
+
+func (b *sqlBase) unmarkVersionApplied(version string) error {
+	_, err := b.currentExec().ExecContext(context.Background(), "DELETE FROM _bamgoo_migrations_v2 WHERE version = ?", version)
+	if strings.ToLower(b.conn.Dialect().Name()) == "pgsql" || strings.ToLower(b.conn.Dialect().Name()) == "postgres" {
+		_, err = b.currentExec().ExecContext(context.Background(), "DELETE FROM _bamgoo_migrations_v2 WHERE version = $1", version)
+	}
+	return err
+}
+
+func (b *sqlBase) ensureMigrationLogTable() error {
+	sqlText := "CREATE TABLE IF NOT EXISTS _bamgoo_migration_logs (id BIGINT PRIMARY KEY, kind TEXT NOT NULL, version TEXT, name TEXT, success BOOLEAN NOT NULL, cost_ms BIGINT NOT NULL, message TEXT, node TEXT, created_at TIMESTAMP NOT NULL)"
+	dn := strings.ToLower(b.conn.Dialect().Name())
+	if strings.Contains(dn, "sqlite") {
+		sqlText = "CREATE TABLE IF NOT EXISTS _bamgoo_migration_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, version TEXT, name TEXT, success INTEGER NOT NULL, cost_ms INTEGER NOT NULL, message TEXT, node TEXT, created_at DATETIME NOT NULL)"
+	} else if strings.Contains(dn, "mysql") {
+		sqlText = "CREATE TABLE IF NOT EXISTS _bamgoo_migration_logs (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `kind` VARCHAR(64) NOT NULL, `version` VARCHAR(191), `name` VARCHAR(255), `success` TINYINT(1) NOT NULL, `cost_ms` BIGINT NOT NULL, `message` TEXT, `node` VARCHAR(255), `created_at` TIMESTAMP NOT NULL)"
+	}
+	_, err := b.currentExec().ExecContext(context.Background(), sqlText)
+	return err
+}
+
+func (b *sqlBase) logMigrationEvent(kind, version, name string, success bool, cost time.Duration, err error) {
+	if b.ensureMigrationLogTable() != nil {
+		return
+	}
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	node := migrationNodeID()
+	now := time.Now()
+	costMS := cost.Milliseconds()
+	dn := strings.ToLower(b.conn.Dialect().Name())
+	switch {
+	case dn == "pgsql" || dn == "postgres":
+		_, _ = b.currentExec().ExecContext(context.Background(),
+			"INSERT INTO _bamgoo_migration_logs(kind,version,name,success,cost_ms,message,node,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+			kind, version, name, success, costMS, msg, node, now)
+	case strings.Contains(dn, "mysql"):
+		_, _ = b.currentExec().ExecContext(context.Background(),
+			"INSERT INTO _bamgoo_migration_logs(kind,version,name,success,cost_ms,message,node,created_at) VALUES(?,?,?,?,?,?,?,?)",
+			kind, version, name, success, costMS, msg, node, now)
+	default:
+		ok := 0
+		if success {
+			ok = 1
+		}
+		_, _ = b.currentExec().ExecContext(context.Background(),
+			"INSERT INTO _bamgoo_migration_logs(kind,version,name,success,cost_ms,message,node,created_at) VALUES(?,?,?,?,?,?,?,?)",
+			kind, version, name, ok, costMS, msg, node, now)
+	}
+}
+
+func migrationNodeID() string {
+	host, _ := os.Hostname()
+	if strings.TrimSpace(host) == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s:%d", host, os.Getpid())
+}
+
+func (b *invalidDataBase) Close() error      { return nil }
+func (b *invalidDataBase) Begin() error      { return b.err }
+func (b *invalidDataBase) Commit() error     { return b.err }
+func (b *invalidDataBase) Rollback() error   { return b.err }
+func (b *invalidDataBase) Tx(TxFunc) error   { return b.err }
+func (b *invalidDataBase) Migrate(...string) {}
+func (b *invalidDataBase) MigratePlan(...string) MigrateReport {
+	return MigrateReport{}
+}
+func (b *invalidDataBase) MigrateDiff(...string) MigrateReport {
+	return MigrateReport{}
+}
+func (b *invalidDataBase) MigrateUp(...string)        {}
+func (b *invalidDataBase) MigrateDown(int)            {}
+func (b *invalidDataBase) MigrateTo(string)           {}
+func (b *invalidDataBase) MigrateDownTo(string)       {}
 func (b *invalidDataBase) Capabilities() Capabilities { return Capabilities{} }
 func (b *invalidDataBase) Error() error               { return b.err }
 func (b *invalidDataBase) ClearError()                {}
@@ -727,10 +1870,9 @@ func (t *invalidTable) Count(...Any) int64             { return 0 }
 func (t *invalidTable) Aggregate(...Any) []Map         { return nil }
 func (t *invalidTable) First(...Any) Map               { return nil }
 func (t *invalidTable) Query(...Any) []Map             { return nil }
-func (t *invalidTable) Range(RangeFunc, ...Any) Res    { return bamgoo.Fail.With(t.err.Error()) }
-func (t *invalidTable) LimitRange(int64, RangeFunc, ...Any) Res {
+func (t *invalidTable) Scan(ScanFunc, ...Any) Res      { return bamgoo.Fail.With(t.err.Error()) }
+func (t *invalidTable) ScanN(int64, ScanFunc, ...Any) Res {
 	return bamgoo.Fail.With(t.err.Error())
 }
-func (t *invalidTable) Limit(int64, int64, ...Any) (int64, []Map) { return 0, nil }
-func (t *invalidTable) Page(int64, int64, ...Any) PageResult      { return PageResult{} }
+func (t *invalidTable) Slice(int64, int64, ...Any) (int64, []Map) { return 0, nil }
 func (t *invalidTable) Group(string, ...Any) []Map                { return nil }

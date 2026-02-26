@@ -23,18 +23,128 @@ type sqlView struct {
 
 var sqlPlanCache sync.Map
 
+func (v *sqlView) mapQueryToStorage(q Query) Query {
+	if v == nil || v.base == nil || !v.base.fieldMappingEnabled() {
+		return q
+	}
+	if len(q.Select) > 0 {
+		out := make([]string, 0, len(q.Select))
+		for _, one := range q.Select {
+			out = append(out, v.base.storageField(one))
+		}
+		q.Select = out
+	}
+	if len(q.Sort) > 0 {
+		out := make([]Sort, 0, len(q.Sort))
+		for _, one := range q.Sort {
+			out = append(out, Sort{Field: v.base.storageField(one.Field), Desc: one.Desc})
+		}
+		q.Sort = out
+	}
+	if len(q.Group) > 0 {
+		out := make([]string, 0, len(q.Group))
+		for _, one := range q.Group {
+			out = append(out, v.base.storageField(one))
+		}
+		q.Group = out
+	}
+	if len(q.Aggs) > 0 {
+		out := make([]Agg, 0, len(q.Aggs))
+		for _, one := range q.Aggs {
+			field := one.Field
+			if field != "*" && field != "" {
+				field = v.base.storageField(field)
+			}
+			out = append(out, Agg{Alias: one.Alias, Op: one.Op, Field: field})
+		}
+		q.Aggs = out
+	}
+	if len(q.After) > 0 {
+		after := Map{}
+		for k, val := range q.After {
+			after[v.base.storageField(k)] = val
+		}
+		q.After = after
+	}
+	if len(q.Joins) > 0 {
+		out := make([]Join, 0, len(q.Joins))
+		for _, j := range q.Joins {
+			out = append(out, Join{
+				From:         j.From,
+				Alias:        j.Alias,
+				Type:         j.Type,
+				LocalField:   v.base.storageField(j.LocalField),
+				ForeignField: v.base.storageField(j.ForeignField),
+				On:           v.mapExprToStorage(j.On),
+			})
+		}
+		q.Joins = out
+	}
+	q.Filter = v.mapExprToStorage(q.Filter)
+	q.Having = v.mapExprToStorage(q.Having)
+	return q
+}
+
+func (v *sqlView) mapExprToStorage(expr Expr) Expr {
+	switch e := expr.(type) {
+	case nil:
+		return nil
+	case TrueExpr:
+		return e
+	case AndExpr:
+		items := make([]Expr, 0, len(e.Items))
+		for _, one := range e.Items {
+			items = append(items, v.mapExprToStorage(one))
+		}
+		return AndExpr{Items: items}
+	case OrExpr:
+		items := make([]Expr, 0, len(e.Items))
+		for _, one := range e.Items {
+			items = append(items, v.mapExprToStorage(one))
+		}
+		return OrExpr{Items: items}
+	case NotExpr:
+		return NotExpr{Item: v.mapExprToStorage(e.Item)}
+	case ExistsExpr:
+		return ExistsExpr{Field: v.base.storageField(e.Field), Yes: e.Yes}
+	case NullExpr:
+		return NullExpr{Field: v.base.storageField(e.Field), Yes: e.Yes}
+	case RawExpr:
+		return e
+	case CmpExpr:
+		return CmpExpr{
+			Field: v.base.storageField(e.Field),
+			Op:    e.Op,
+			Value: v.mapValueToStorage(e.Value),
+		}
+	default:
+		return e
+	}
+}
+
+func (v *sqlView) mapValueToStorage(val Any) Any {
+	switch vv := val.(type) {
+	case FieldRef:
+		return Ref(v.base.storageField(string(vv)))
+	default:
+		return val
+	}
+}
+
 func (v *sqlView) Count(args ...Any) int64 {
 	q, err := ParseQuery(args...)
 	if err != nil {
 		v.base.setError(wrapErr(v.name+".count.parse", ErrInvalidQuery, err))
 		return 0
 	}
+	q = v.mapQueryToStorage(q)
 	if total, ok := v.loadCountCache(q); ok {
 		statsFor(v.base.inst.Name).CacheHit.Add(1)
 		v.base.setError(nil)
 		return total
 	}
 	builder := NewSQLBuilder(v.base.conn.Dialect())
+	v.bindBuilder(builder, q)
 	from, joins, err := v.buildFrom(q, builder)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
@@ -72,6 +182,7 @@ func (v *sqlView) First(args ...Any) Map {
 		v.base.setError(wrapErr(v.name+".first.parse", ErrInvalidQuery, err))
 		return nil
 	}
+	q = v.mapQueryToStorage(q)
 	q.Limit = 1
 	items, err := v.queryWithQuery(q)
 	if err != nil {
@@ -97,6 +208,7 @@ func (v *sqlView) Query(args ...Any) []Map {
 		v.base.setError(wrapErr(v.name+".query.parse", ErrInvalidQuery, err))
 		return nil
 	}
+	q = v.mapQueryToStorage(q)
 	items, err := v.queryWithQuery(q)
 	if err != nil {
 		v.base.setError(wrapErr(v.name+".query.run", ErrInvalidQuery, err))
@@ -130,16 +242,17 @@ func (v *sqlView) Aggregate(args ...Any) []Map {
 		// default aggregate: count
 		q.Aggs = []Agg{{Alias: "$count", Op: "count", Field: "*"}}
 	}
+	q = v.mapQueryToStorage(q)
 	items, err := v.queryWithQuery(q)
 	v.base.setError(err)
 	return items
 }
 
-func (v *sqlView) Range(next RangeFunc, args ...Any) Res {
-	return v.LimitRange(0, next, args...)
+func (v *sqlView) Scan(next ScanFunc, args ...Any) Res {
+	return v.ScanN(0, next, args...)
 }
 
-func (v *sqlView) LimitRange(limit int64, next RangeFunc, args ...Any) Res {
+func (v *sqlView) ScanN(limit int64, next ScanFunc, args ...Any) Res {
 	if next == nil || limit < 0 {
 		return bamgoo.Fail
 	}
@@ -151,6 +264,7 @@ func (v *sqlView) LimitRange(limit int64, next RangeFunc, args ...Any) Res {
 	if limit > 0 {
 		q.Limit = limit
 	}
+	q = v.mapQueryToStorage(q)
 
 	res := v.streamWithQuery(q, next)
 	if res == nil {
@@ -159,7 +273,7 @@ func (v *sqlView) LimitRange(limit int64, next RangeFunc, args ...Any) Res {
 	return res
 }
 
-func (v *sqlView) Limit(offset, limit int64, args ...Any) (int64, []Map) {
+func (v *sqlView) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 	q, err := ParseQuery(args...)
 	if err != nil {
 		v.base.setError(wrapErr(v.name+".limit.parse", ErrInvalidQuery, err))
@@ -167,13 +281,10 @@ func (v *sqlView) Limit(offset, limit int64, args ...Any) (int64, []Map) {
 	}
 	q.Offset = offset
 	q.Limit = limit
-	total := int64(-1)
-	if q.WithCount {
-		total = v.Count(args...)
-		if v.base.Error() != nil {
-			v.base.setError(wrapErr(v.name+".limit.count", ErrInvalidQuery, v.base.Error()))
-			return 0, nil
-		}
+	total := v.Count(args...)
+	if v.base.Error() != nil {
+		v.base.setError(wrapErr(v.name+".limit.count", ErrInvalidQuery, v.base.Error()))
+		return 0, nil
 	}
 	items := v.Query(withQuery(args, q)...)
 	if v.base.Error() != nil {
@@ -181,11 +292,6 @@ func (v *sqlView) Limit(offset, limit int64, args ...Any) (int64, []Map) {
 		return 0, nil
 	}
 	return total, items
-}
-
-func (v *sqlView) Page(offset, limit int64, args ...Any) PageResult {
-	total, items := v.Limit(offset, limit, args...)
-	return PageResult{Offset: offset, Limit: limit, Total: total, Items: items}
 }
 
 func withQuery(args []Any, q Query) []Any {
@@ -215,7 +321,9 @@ func (v *sqlView) Group(field string, args ...Any) []Map {
 		return nil
 	}
 	q.Group = []string{field}
+	q = v.mapQueryToStorage(q)
 	builder := NewSQLBuilder(v.base.conn.Dialect())
+	v.bindBuilder(builder, q)
 	from, joins, err := v.buildFrom(q, builder)
 	if err != nil {
 		v.base.setError(wrapErr(v.name+".group.from", ErrInvalidQuery, err))
@@ -226,9 +334,15 @@ func (v *sqlView) Group(field string, args ...Any) []Map {
 		v.base.setError(wrapErr(v.name+".group.where", ErrInvalidQuery, err))
 		return nil
 	}
-	groupField := quoteField(v.base.conn.Dialect(), field)
+	groupField := quoteField(v.base.conn.Dialect(), v.base.storageField(field))
 	sql := "SELECT " + groupField + " AS " + v.base.conn.Dialect().Quote(field) + ", COUNT(1) AS " + v.base.conn.Dialect().Quote("$count") +
-		" FROM " + from + joins + " WHERE " + where + BuildGroupBy(q.Group, v.base.conn.Dialect()) + BuildOrderBy(q, v.base.conn.Dialect())
+		" FROM " + from + joins + " WHERE " + where + BuildGroupBy(q.Group, v.base.conn.Dialect())
+	orderBy, err := v.buildOrderBy(q)
+	if err != nil {
+		v.base.setError(wrapErr(v.name+".group.order", ErrInvalidQuery, err))
+		return nil
+	}
+	sql += orderBy
 	start := time.Now()
 	rows, err := v.base.currentExec().QueryContext(context.Background(), sql, toInterfaces(params)...)
 	if err != nil {
@@ -246,7 +360,7 @@ func (v *sqlView) Group(field string, args ...Any) []Map {
 	statsFor(v.base.inst.Name).Queries.Add(1)
 	v.base.logSlow(sql, params, start)
 	v.base.setError(nil)
-	return items
+	return v.base.appMaps(items)
 }
 
 func (v *sqlView) queryWithQuery(q Query) ([]Map, error) {
@@ -259,6 +373,7 @@ func (v *sqlView) queryWithQuery(q Query) ([]Map, error) {
 	}
 
 	builder := NewSQLBuilder(v.base.conn.Dialect())
+	v.bindBuilder(builder, q)
 	from, joins, err := v.buildFrom(q, builder)
 	if err != nil {
 		return nil, err
@@ -302,7 +417,11 @@ func (v *sqlView) queryWithQuery(q Query) ([]Map, error) {
 			sql += " HAVING " + havingSQL
 		}
 	}
-	sql += BuildOrderBy(q, v.base.conn.Dialect())
+	orderBy, err := v.buildOrderBy(q)
+	if err != nil {
+		return nil, err
+	}
+	sql += orderBy
 	sql += BuildLimitOffset(q, len(params)+1, v.base.conn.Dialect(), &params)
 
 	sql = v.cacheSQL(sql, q)
@@ -319,17 +438,19 @@ func (v *sqlView) queryWithQuery(q Query) ([]Map, error) {
 		statsFor(v.base.inst.Name).Errors.Add(1)
 		return nil, wrapErr(v.name+".query.scan", ErrInvalidQuery, classifySQLError(err))
 	}
+	items = v.base.appMaps(items)
 	statsFor(v.base.inst.Name).Queries.Add(1)
 	v.storeQueryCache(q, items)
 	return items, nil
 }
 
-func (v *sqlView) streamWithQuery(q Query, next RangeFunc) Res {
+func (v *sqlView) streamWithQuery(q Query, next ScanFunc) Res {
 	if err := v.applyAfter(&q); err != nil {
 		return bamgoo.Fail.With(err.Error())
 	}
 
 	builder := NewSQLBuilder(v.base.conn.Dialect())
+	v.bindBuilder(builder, q)
 	from, joins, err := v.buildFrom(q, builder)
 	if err != nil {
 		return bamgoo.Fail.With(err.Error())
@@ -373,7 +494,11 @@ func (v *sqlView) streamWithQuery(q Query, next RangeFunc) Res {
 			sqlText += " HAVING " + havingSQL
 		}
 	}
-	sqlText += BuildOrderBy(q, v.base.conn.Dialect())
+	orderBy, err := v.buildOrderBy(q)
+	if err != nil {
+		return bamgoo.Fail.With(err.Error())
+	}
+	sqlText += orderBy
 	sqlText += BuildLimitOffset(q, len(params)+1, v.base.conn.Dialect(), &params)
 
 	sqlText = v.cacheSQL(sqlText, q)
@@ -409,6 +534,7 @@ func (v *sqlView) streamWithQuery(q Query, next RangeFunc) Res {
 				item[col] = vv
 			}
 		}
+		item = v.base.appMap(item)
 
 		if len(q.Aggs) == 0 && len(q.Group) == 0 {
 			decoded, err := v.decode(item)
@@ -443,6 +569,122 @@ func (v *sqlView) cacheSQL(sqlText string, q Query) string {
 		}
 	}
 	return sqlText
+}
+
+func (v *sqlView) bindBuilder(builder *SQLBuilder, q Query) {
+	if builder == nil {
+		return
+	}
+	builder.isAlias = func(name string) bool {
+		return v.isKnownAlias(name, q)
+	}
+	builder.isJSONField = v.isJSONField
+	builder.toStorage = v.base.storageField
+}
+
+func (v *sqlView) buildOrderBy(q Query) (string, error) {
+	if len(q.Sort) == 0 {
+		return "", nil
+	}
+	d := v.base.conn.Dialect()
+	dn := strings.ToLower(d.Name())
+	parts := make([]string, 0, len(q.Sort))
+	for _, s := range q.Sort {
+		field := strings.TrimSpace(s.Field)
+		if field == "" {
+			continue
+		}
+		expr := ""
+		if strings.Contains(field, ".") {
+			top := strings.SplitN(field, ".", 2)[0]
+			if v.isKnownAlias(top, q) {
+				expr = quoteField(d, field)
+			} else if v.isJSONField(top) {
+				path := strings.Split(field, ".")[1:]
+				j, err := v.buildJSONSortExpr(top, path, dn)
+				if err != nil {
+					return "", err
+				}
+				expr = j
+			} else {
+				return "", fmt.Errorf("ambiguous sort field %s: neither alias.field nor jsonPath on JSON field", field)
+			}
+		} else {
+			expr = quoteField(d, field)
+		}
+		if s.Desc {
+			parts = append(parts, expr+" DESC")
+		} else {
+			parts = append(parts, expr+" ASC")
+		}
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return " ORDER BY " + strings.Join(parts, ","), nil
+}
+
+func (v *sqlView) isKnownAlias(name string, q Query) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	if strings.EqualFold(name, v.name) || strings.EqualFold(name, v.source) {
+		return true
+	}
+	for _, j := range q.Joins {
+		alias := strings.TrimSpace(j.Alias)
+		if alias == "" {
+			alias = strings.TrimSpace(j.From)
+		}
+		if strings.EqualFold(name, alias) || strings.EqualFold(name, strings.TrimSpace(j.From)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *sqlView) isJSONField(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	candidates := []string{name}
+	if v.base.fieldMappingEnabled() {
+		candidates = append(candidates, v.base.appField(name), v.base.storageField(name))
+	}
+	for _, one := range candidates {
+		cfg, ok := v.fields[one]
+		if !ok {
+			continue
+		}
+		t := strings.ToLower(strings.TrimSpace(cfg.Type))
+		if t == "json" || t == "jsonb" || strings.HasPrefix(t, "map") {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *sqlView) buildJSONSortExpr(field string, path []string, dialect string) (string, error) {
+	if len(path) == 0 {
+		return quoteField(v.base.conn.Dialect(), field), nil
+	}
+	d := v.base.conn.Dialect()
+	base := d.Quote(v.base.storageField(field))
+	switch {
+	case dialect == "pgsql" || dialect == "postgres":
+		if len(path) == 1 {
+			return fmt.Sprintf("(%s->>'%s')", base, path[0]), nil
+		}
+		return fmt.Sprintf("(%s#>>'{%s}')", base, strings.Join(path, ",")), nil
+	case dialect == "mysql":
+		return fmt.Sprintf("JSON_UNQUOTE(JSON_EXTRACT(%s, '$.%s'))", base, strings.Join(path, ".")), nil
+	case dialect == "sqlite":
+		return fmt.Sprintf("json_extract(%s, '$.%s')", base, strings.Join(path, ".")), nil
+	default:
+		return "", fmt.Errorf("dialect %s does not support json sort path %s.%s", dialect, field, strings.Join(path, "."))
+	}
 }
 
 func (q Query) cacheKey(dialect, name string) string {
@@ -507,6 +749,7 @@ func (v *sqlView) buildFrom(q Query, builder *SQLBuilder) (string, string, error
 }
 
 func (v *sqlView) decode(item Map) (Map, error) {
+	item = v.base.appMap(item)
 	if len(v.fields) == 0 {
 		return item, nil
 	}
