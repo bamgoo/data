@@ -3,6 +3,12 @@ package data
 import . "github.com/bamgoo/base"
 
 type (
+	Index struct {
+		Name   string
+		Fields []string
+		Unique bool
+	}
+
 	Table struct {
 		Name    string
 		Desc    string
@@ -10,6 +16,7 @@ type (
 		Table   string
 		Key     string
 		Fields  Vars
+		Indexes []Index
 		Setting Map
 	}
 

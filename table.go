@@ -14,14 +14,16 @@ type sqlTable struct {
 	sqlView
 }
 
-func (t *sqlTable) Create(data Map) (Map, error) {
+func (t *sqlTable) Create(data Map) Map {
 	val, err := mapCreate(t.fields, data)
 	if err != nil {
-		return nil, wrapErr(t.name+".create.map", ErrInvalidUpdate, err)
+		t.base.setError(wrapErr(t.name+".create.map", ErrInvalidUpdate, err))
+		return nil
 	}
 	val = t.normalizeWriteMap(val)
 	if len(val) == 0 {
-		return nil, wrapErr(t.name+".create.empty", ErrInvalidUpdate, fmt.Errorf("empty create data"))
+		t.base.setError(wrapErr(t.name+".create.empty", ErrInvalidUpdate, fmt.Errorf("empty create data")))
+		return nil
 	}
 
 	d := t.base.conn.Dialect()
@@ -45,45 +47,136 @@ func (t *sqlTable) Create(data Map) (Map, error) {
 		var id any
 		if err := t.base.currentExec().QueryRowContext(context.Background(), sqlText, toInterfaces(vals)...).Scan(&id); err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
-			return nil, wrapErr(t.name+".create.return", ErrInvalidUpdate, classifySQLError(err))
+			t.base.setError(wrapErr(t.name+".create.return", ErrInvalidUpdate, classifySQLError(err)))
+			return nil
 		}
 		val[t.key] = id
 	} else {
 		res, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(vals)...)
 		if err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
-			return nil, wrapErr(t.name+".create.exec", ErrInvalidUpdate, classifySQLError(err))
+			t.base.setError(wrapErr(t.name+".create.exec", ErrInvalidUpdate, classifySQLError(err)))
+			return nil
 		}
 		if id, err := res.LastInsertId(); err == nil {
 			val[t.key] = id
 		}
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
-	cacheVersionBump(t.base.inst.Name)
+	cacheTouchTable(t.base.inst.Name, t.source)
 
-	return val, nil
+	t.base.setError(nil)
+	return val
 }
 
-func (t *sqlTable) CreateMany(items []Map) ([]Map, error) {
+func (t *sqlTable) CreateMany(items []Map) []Map {
 	if len(items) == 0 {
-		return []Map{}, nil
+		t.base.setError(nil)
+		return []Map{}
+	}
+	if out, ok, err := t.createManyBatch(items); ok {
+		t.base.setError(err)
+		return out
 	}
 	out := make([]Map, 0, len(items))
 	err := t.base.Tx(func(db DataBase) error {
 		tb := db.Table(t.name)
 		for _, item := range items {
-			one, err := tb.Create(item)
-			if err != nil {
-				return wrapErr(t.name+".createMany.item", ErrInvalidUpdate, err)
+			one := tb.Create(item)
+			if db.Error() != nil {
+				return wrapErr(t.name+".createMany.item", ErrInvalidUpdate, db.Error())
 			}
 			out = append(out, one)
 		}
 		return nil
 	})
-	return out, wrapErr(t.name+".createMany", ErrInvalidUpdate, err)
+	t.base.setError(wrapErr(t.name+".createMany", ErrInvalidUpdate, err))
+	return out
 }
 
-func (t *sqlTable) Upsert(data Map, args ...Any) (Map, error) {
+func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
+	normalized := make([]Map, 0, len(items))
+	keySet := make(map[string]struct{}, 8)
+	for _, item := range items {
+		val, err := mapCreate(t.fields, item)
+		if err != nil {
+			return nil, true, wrapErr(t.name+".createMany.map", ErrInvalidUpdate, err)
+		}
+		val = t.normalizeWriteMap(val)
+		if len(val) == 0 {
+			return nil, true, wrapErr(t.name+".createMany.empty", ErrInvalidUpdate, fmt.Errorf("empty create data"))
+		}
+		normalized = append(normalized, val)
+		for k, v := range val {
+			if k == t.key && v == nil {
+				continue
+			}
+			keySet[k] = struct{}{}
+		}
+	}
+	if len(keySet) == 0 {
+		return nil, true, wrapErr(t.name+".createMany.cols", ErrInvalidUpdate, fmt.Errorf("no insert columns"))
+	}
+	cols := make([]string, 0, len(keySet))
+	for k := range keySet {
+		cols = append(cols, k)
+	}
+	sort.Strings(cols)
+
+	d := t.base.conn.Dialect()
+	valuesSQL := make([]string, 0, len(normalized))
+	args := make([]Any, 0, len(normalized)*len(cols))
+	for _, row := range normalized {
+		ph := make([]string, 0, len(cols))
+		for _, col := range cols {
+			args = append(args, row[col])
+			ph = append(ph, d.Placeholder(len(args)))
+		}
+		valuesSQL = append(valuesSQL, "("+strings.Join(ph, ",")+")")
+	}
+	quotedCols := make([]string, 0, len(cols))
+	for _, col := range cols {
+		quotedCols = append(quotedCols, d.Quote(col))
+	}
+	sqlText := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", t.base.sourceExpr(t.schema, t.source), strings.Join(quotedCols, ","), strings.Join(valuesSQL, ","))
+
+	if d.SupportsReturning() {
+		sqlText += " RETURNING " + d.Quote(t.key)
+		rows, err := t.base.currentExec().QueryContext(context.Background(), sqlText, toInterfaces(args)...)
+		if err != nil {
+			statsFor(t.base.inst.Name).Errors.Add(1)
+			return nil, true, wrapErr(t.name+".createMany.returning", ErrInvalidUpdate, classifySQLError(err))
+		}
+		defer rows.Close()
+		i := 0
+		for rows.Next() {
+			var id any
+			if err := rows.Scan(&id); err != nil {
+				statsFor(t.base.inst.Name).Errors.Add(1)
+				return nil, true, wrapErr(t.name+".createMany.scan", ErrInvalidUpdate, classifySQLError(err))
+			}
+			if i < len(normalized) {
+				normalized[i][t.key] = id
+			}
+			i++
+		}
+		if err := rows.Err(); err != nil {
+			statsFor(t.base.inst.Name).Errors.Add(1)
+			return nil, true, wrapErr(t.name+".createMany.rows", ErrInvalidUpdate, classifySQLError(err))
+		}
+	} else {
+		if _, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(args)...); err != nil {
+			statsFor(t.base.inst.Name).Errors.Add(1)
+			// fallback to per-row in case dialect/driver has edge-case restrictions
+			return nil, false, nil
+		}
+	}
+	statsFor(t.base.inst.Name).Writes.Add(int64(len(normalized)))
+	cacheTouchTable(t.base.inst.Name, t.source)
+	return normalized, true, nil
+}
+
+func (t *sqlTable) Upsert(data Map, args ...Any) Map {
 	condition := Map{}
 	if len(args) > 0 {
 		if m, ok := args[0].(Map); ok {
@@ -103,12 +196,14 @@ func (t *sqlTable) Upsert(data Map, args ...Any) (Map, error) {
 
 	createData := t.upsertCreateData(data, condition)
 	if item, err := t.upsertNative(createData, condition); err == nil && item != nil {
-		return item, nil
+		t.base.setError(nil)
+		return item
 	}
 
-	item, err := t.First(condition)
-	if err != nil {
-		return nil, wrapErr(t.name+".upsert.first", ErrInvalidQuery, err)
+	item := t.First(condition)
+	if t.base.Error() != nil {
+		t.base.setError(wrapErr(t.name+".upsert.first", ErrInvalidQuery, t.base.Error()))
+		return nil
 	}
 	if item == nil {
 		return t.Create(createData)
@@ -116,36 +211,41 @@ func (t *sqlTable) Upsert(data Map, args ...Any) (Map, error) {
 	return t.Change(item, data)
 }
 
-func (t *sqlTable) UpsertMany(items []Map, args ...Any) ([]Map, error) {
+func (t *sqlTable) UpsertMany(items []Map, args ...Any) []Map {
 	if len(items) == 0 {
-		return []Map{}, nil
+		t.base.setError(nil)
+		return []Map{}
 	}
 	out := make([]Map, 0, len(items))
 	err := t.base.Tx(func(db DataBase) error {
 		tb := db.Table(t.name)
 		for _, item := range items {
-			one, err := tb.Upsert(item, args...)
-			if err != nil {
-				return wrapErr(t.name+".upsertMany.item", ErrInvalidUpdate, err)
+			one := tb.Upsert(item, args...)
+			if db.Error() != nil {
+				return wrapErr(t.name+".upsertMany.item", ErrInvalidUpdate, db.Error())
 			}
 			out = append(out, one)
 		}
 		return nil
 	})
-	return out, wrapErr(t.name+".upsertMany", ErrInvalidUpdate, err)
+	t.base.setError(wrapErr(t.name+".upsertMany", ErrInvalidUpdate, err))
+	return out
 }
 
-func (t *sqlTable) Change(item Map, data Map) (Map, error) {
+func (t *sqlTable) Change(item Map, data Map) Map {
 	if item == nil || item[t.key] == nil {
-		return nil, wrapErr(t.name+".change.key", ErrInvalidUpdate, fmt.Errorf("missing primary key %s", t.key))
+		t.base.setError(wrapErr(t.name+".change.key", ErrInvalidUpdate, fmt.Errorf("missing primary key %s", t.key)))
+		return nil
 	}
 
 	assigns, vals, err := t.compileAssignments(data, item, 1)
 	if err != nil {
-		return nil, wrapErr(t.name+".change.assign", ErrInvalidUpdate, err)
+		t.base.setError(wrapErr(t.name+".change.assign", ErrInvalidUpdate, err))
+		return nil
 	}
 	if len(assigns) == 0 {
-		return item, nil
+		t.base.setError(nil)
+		return item
 	}
 
 	d := t.base.conn.Dialect()
@@ -154,53 +254,70 @@ func (t *sqlTable) Change(item Map, data Map) (Map, error) {
 	sqlText := fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s", t.base.sourceExpr(t.schema, t.source), strings.Join(assigns, ","), d.Quote(t.key), d.Placeholder(len(vals)))
 	if _, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(vals)...); err != nil {
 		statsFor(t.base.inst.Name).Errors.Add(1)
-		return nil, wrapErr(t.name+".change.exec", ErrInvalidUpdate, classifySQLError(err))
+		t.base.setError(wrapErr(t.name+".change.exec", ErrInvalidUpdate, classifySQLError(err)))
+		return nil
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
-	cacheVersionBump(t.base.inst.Name)
+	cacheTouchTable(t.base.inst.Name, t.source)
 
 	out := Map{}
 	for k, v := range item {
 		out[k] = v
 	}
-	setMap, _, _, _, _ := t.parseUpdateData(data, item, true)
+	setMap, _, _, _, _, _ := t.parseUpdateData(data, item, true)
 	for k, v := range setMap {
 		out[k] = v
 	}
-	return out, nil
+	t.base.setError(nil)
+	return out
 }
 
-func (t *sqlTable) Remove(args ...Any) (Map, error) {
-	item, err := t.First(args...)
-	if err != nil || item == nil {
-		if err != nil {
-			return nil, wrapErr(t.name+".remove.first", ErrNotFound, err)
+func (t *sqlTable) Remove(args ...Any) Map {
+	item := t.First(args...)
+	if t.base.Error() != nil || item == nil {
+		if t.base.Error() != nil {
+			t.base.setError(wrapErr(t.name+".remove.first", ErrNotFound, t.base.Error()))
+			return nil
 		}
-		return nil, wrapErr(t.name+".remove.first", ErrNotFound, ErrNotFound)
+		t.base.setError(wrapErr(t.name+".remove.first", ErrNotFound, ErrNotFound))
+		return nil
 	}
 	d := t.base.conn.Dialect()
 	sqlText := fmt.Sprintf("DELETE FROM %s WHERE %s = %s", t.base.sourceExpr(t.schema, t.source), d.Quote(t.key), d.Placeholder(1))
 	if _, err := t.base.currentExec().ExecContext(context.Background(), sqlText, item[t.key]); err != nil {
 		statsFor(t.base.inst.Name).Errors.Add(1)
-		return nil, wrapErr(t.name+".remove.exec", ErrInvalidQuery, classifySQLError(err))
+		t.base.setError(wrapErr(t.name+".remove.exec", ErrInvalidQuery, classifySQLError(err)))
+		return nil
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
-	cacheVersionBump(t.base.inst.Name)
-	return item, nil
+	cacheTouchTable(t.base.inst.Name, t.source)
+	t.base.setError(nil)
+	return item
 }
 
-func (t *sqlTable) Update(sets Map, args ...Any) (int64, error) {
-	assign, vals, err := t.compileAssignments(sets, nil, 1)
-	if err != nil {
-		return 0, wrapErr(t.name+".update.assign", ErrInvalidUpdate, err)
-	}
-	if len(assign) == 0 {
-		return 0, nil
-	}
-
+func (t *sqlTable) Update(sets Map, args ...Any) int64 {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return 0, wrapErr(t.name+".update.parse", ErrInvalidQuery, err)
+		t.base.setError(wrapErr(t.name+".update.parse", ErrInvalidQuery, err))
+		return 0
+	}
+	if t.blockUnsafeMutation(q) {
+		t.base.setError(wrapErr(t.name+".update.unsafe", ErrInvalidQuery, fmt.Errorf("unsafe update blocked, set %s=true to allow full-table update", OptUnsafe)))
+		return 0
+	}
+	if t.hasCollectionUpdate(sets) {
+		affected, err := t.updateByEntityLoop(sets, q)
+		t.base.setError(err)
+		return affected
+	}
+	assign, vals, err := t.compileAssignments(sets, nil, 1)
+	if err != nil {
+		t.base.setError(wrapErr(t.name+".update.assign", ErrInvalidUpdate, err))
+		return 0
+	}
+	if len(assign) == 0 {
+		t.base.setError(nil)
+		return 0
 	}
 	d := t.base.conn.Dialect()
 
@@ -208,7 +325,8 @@ func (t *sqlTable) Update(sets Map, args ...Any) (int64, error) {
 	builder.index = len(vals) + 1
 	where, p, err := builder.CompileWhere(q)
 	if err != nil {
-		return 0, wrapErr(t.name+".update.where", ErrInvalidQuery, err)
+		t.base.setError(wrapErr(t.name+".update.where", ErrInvalidQuery, err))
+		return 0
 	}
 	for _, arg := range p {
 		vals = append(vals, arg)
@@ -218,55 +336,67 @@ func (t *sqlTable) Update(sets Map, args ...Any) (int64, error) {
 	res, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(vals)...)
 	if err != nil {
 		statsFor(t.base.inst.Name).Errors.Add(1)
-		return 0, wrapErr(t.name+".update.exec", ErrInvalidUpdate, classifySQLError(err))
+		t.base.setError(wrapErr(t.name+".update.exec", ErrInvalidUpdate, classifySQLError(err)))
+		return 0
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
-	cacheVersionBump(t.base.inst.Name)
+	cacheTouchTable(t.base.inst.Name, t.source)
 	affected, err := res.RowsAffected()
 	if err != nil {
 		statsFor(t.base.inst.Name).Errors.Add(1)
-		return 0, wrapErr(t.name+".update.rows", ErrInvalidQuery, classifySQLError(err))
+		t.base.setError(wrapErr(t.name+".update.rows", ErrInvalidQuery, classifySQLError(err)))
+		return 0
 	}
-	return affected, nil
+	t.base.setError(nil)
+	return affected
 }
 
-func (t *sqlTable) Delete(args ...Any) (int64, error) {
+func (t *sqlTable) Delete(args ...Any) int64 {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return 0, wrapErr(t.name+".delete.parse", ErrInvalidQuery, err)
+		t.base.setError(wrapErr(t.name+".delete.parse", ErrInvalidQuery, err))
+		return 0
+	}
+	if t.blockUnsafeMutation(q) {
+		t.base.setError(wrapErr(t.name+".delete.unsafe", ErrInvalidQuery, fmt.Errorf("unsafe delete blocked, set %s=true to allow full-table delete", OptUnsafe)))
+		return 0
 	}
 	b := NewSQLBuilder(t.base.conn.Dialect())
 	where, params, err := b.CompileWhere(q)
 	if err != nil {
-		return 0, wrapErr(t.name+".delete.where", ErrInvalidQuery, err)
+		t.base.setError(wrapErr(t.name+".delete.where", ErrInvalidQuery, err))
+		return 0
 	}
 	sqlText := fmt.Sprintf("DELETE FROM %s WHERE %s", t.base.sourceExpr(t.schema, t.source), where)
 	res, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(params)...)
 	if err != nil {
 		statsFor(t.base.inst.Name).Errors.Add(1)
-		return 0, wrapErr(t.name+".delete.exec", ErrInvalidQuery, classifySQLError(err))
+		t.base.setError(wrapErr(t.name+".delete.exec", ErrInvalidQuery, classifySQLError(err)))
+		return 0
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
-	cacheVersionBump(t.base.inst.Name)
+	cacheTouchTable(t.base.inst.Name, t.source)
 	affected, err := res.RowsAffected()
 	if err != nil {
 		statsFor(t.base.inst.Name).Errors.Add(1)
-		return 0, wrapErr(t.name+".delete.rows", ErrInvalidQuery, classifySQLError(err))
+		t.base.setError(wrapErr(t.name+".delete.rows", ErrInvalidQuery, classifySQLError(err)))
+		return 0
 	}
-	return affected, nil
+	t.base.setError(nil)
+	return affected
 }
 
-func (t *sqlTable) Entity(id Any) (Map, error) {
+func (t *sqlTable) Entity(id Any) Map {
 	return t.First(Map{t.key: id})
 }
 
-func (t *sqlTable) Page(offset, limit int64, args ...Any) (PageResult, error) {
+func (t *sqlTable) Page(offset, limit int64, args ...Any) PageResult {
 	return t.sqlView.Page(offset, limit, args...)
 }
 
 func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]string, []Any, error) {
 	d := t.base.conn.Dialect()
-	setPart, incPart, unsetPart, pathPart, err := t.parseUpdateData(input, current, current != nil)
+	setPart, incPart, unsetPart, pathPart, unsetPathPart, err := t.parseUpdateData(input, current, current != nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -277,8 +407,8 @@ func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]stri
 	}
 	setVal = t.normalizeWriteMap(setVal)
 
-	clauses := make([]string, 0, len(setVal)+len(incPart)+len(unsetPart)+len(pathPart))
-	vals := make([]Any, 0, len(setVal)+len(incPart)+len(pathPart)*2)
+	clauses := make([]string, 0, len(setVal)+len(incPart)+len(unsetPart)+len(pathPart)+len(unsetPathPart))
+	vals := make([]Any, 0, len(setVal)+len(incPart)+len(pathPart)*2+len(unsetPathPart))
 	placeholderIdx := start
 
 	for k, v := range setVal {
@@ -358,15 +488,57 @@ func (t *sqlTable) compileAssignments(input Map, current Map, start int) ([]stri
 			return nil, nil, wrapErr("update.path", ErrUnsupported, fmt.Errorf("dialect %s does not support %s", d.Name(), UpdSetPath))
 		}
 	}
+	for _, path := range unsetPathPart {
+		parts := strings.Split(path, ".")
+		if len(parts) < 2 {
+			continue
+		}
+		field := strings.TrimSpace(parts[0])
+		if field == "" || field == t.key {
+			continue
+		}
+		segments := make([]string, 0, len(parts)-1)
+		for _, seg := range parts[1:] {
+			seg = strings.TrimSpace(seg)
+			if seg != "" {
+				segments = append(segments, seg)
+			}
+		}
+		if len(segments) == 0 {
+			continue
+		}
+		fieldExpr := d.Quote(field)
+		name := strings.ToLower(d.Name())
+		switch {
+		case name == "pgsql" || name == "postgres":
+			vals = append(vals, "{"+strings.Join(segments, ",")+"}")
+			pathPH := d.Placeholder(placeholderIdx)
+			placeholderIdx++
+			clauses = append(clauses, fieldExpr+" = COALESCE("+fieldExpr+", '{}'::jsonb) #- "+pathPH+"::text[]")
+		case name == "mysql":
+			vals = append(vals, "$."+strings.Join(segments, "."))
+			pathPH := d.Placeholder(placeholderIdx)
+			placeholderIdx++
+			clauses = append(clauses, fieldExpr+" = JSON_REMOVE(COALESCE("+fieldExpr+", JSON_OBJECT()), "+pathPH+")")
+		case name == "sqlite":
+			vals = append(vals, "$."+strings.Join(segments, "."))
+			pathPH := d.Placeholder(placeholderIdx)
+			placeholderIdx++
+			clauses = append(clauses, fieldExpr+" = json_remove(COALESCE("+fieldExpr+", '{}'), "+pathPH+")")
+		default:
+			return nil, nil, wrapErr("update.unsetPath", ErrUnsupported, fmt.Errorf("dialect %s does not support %s", d.Name(), UpdUnsetPath))
+		}
+	}
 
 	return clauses, vals, nil
 }
 
-func (t *sqlTable) parseUpdateData(input Map, current Map, allowCollection bool) (Map, Map, []string, Map, error) {
+func (t *sqlTable) parseUpdateData(input Map, current Map, allowCollection bool) (Map, Map, []string, Map, []string, error) {
 	setPart := Map{}
 	incPart := Map{}
 	unsetPart := make([]string, 0)
 	pathPart := Map{}
+	unsetPathPart := make([]string, 0)
 	hasCollection := false
 
 	for k, v := range input {
@@ -421,6 +593,30 @@ func (t *sqlTable) parseUpdateData(input Map, current Map, allowCollection bool)
 					}
 				}
 			}
+		case UpdUnsetPath:
+			switch vv := v.(type) {
+			case string:
+				vv = strings.TrimSpace(vv)
+				if vv != "" {
+					unsetPathPart = append(unsetPathPart, vv)
+				}
+			case []string:
+				for _, one := range vv {
+					one = strings.TrimSpace(one)
+					if one != "" {
+						unsetPathPart = append(unsetPathPart, one)
+					}
+				}
+			case []Any:
+				for _, one := range vv {
+					if s, ok := one.(string); ok {
+						s = strings.TrimSpace(s)
+						if s != "" {
+							unsetPathPart = append(unsetPathPart, s)
+						}
+					}
+				}
+			}
 		case UpdPush, UpdPull, UpdAddToSet:
 			hasCollection = true
 		default:
@@ -431,11 +627,11 @@ func (t *sqlTable) parseUpdateData(input Map, current Map, allowCollection bool)
 	}
 
 	if hasCollection && !allowCollection {
-		return nil, nil, nil, nil, wrapErr("update.collection", ErrUnsupported, fmt.Errorf("%s/%s/%s needs entity context", UpdPush, UpdPull, UpdAddToSet))
+		return nil, nil, nil, nil, nil, wrapErr("update.collection", ErrUnsupported, fmt.Errorf("%s/%s/%s needs entity context", UpdPush, UpdPull, UpdAddToSet))
 	}
 
 	setPart = t.applyCollectionUpdates(setPart, current, input)
-	return setPart, incPart, unsetPart, pathPart, nil
+	return setPart, incPart, unsetPart, pathPart, unsetPathPart, nil
 }
 
 func (t *sqlTable) applyCollectionUpdates(setPart Map, current Map, input Map) Map {
@@ -680,7 +876,7 @@ func (t *sqlTable) upsertNative(data Map, condition Map) (Map, error) {
 		}
 		out[t.key] = id
 		statsFor(t.base.inst.Name).Writes.Add(1)
-		cacheVersionBump(t.base.inst.Name)
+		cacheTouchTable(t.base.inst.Name, t.source)
 		return out, nil
 	}
 	res, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(insertVals)...)
@@ -692,12 +888,12 @@ func (t *sqlTable) upsertNative(data Map, condition Map) (Map, error) {
 		out[t.key] = id
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
-	cacheVersionBump(t.base.inst.Name)
+	cacheTouchTable(t.base.inst.Name, t.source)
 	return out, nil
 }
 
 func (t *sqlTable) upsertCreateData(data Map, condition Map) Map {
-	setPart, incPart, _, _, _ := t.parseUpdateData(data, nil, false)
+	setPart, incPart, _, _, _, _ := t.parseUpdateData(data, nil, false)
 	out := Map{}
 	for k, v := range condition {
 		out[k] = v
@@ -712,4 +908,66 @@ func (t *sqlTable) upsertCreateData(data Map, condition Map) Map {
 		}
 	}
 	return out
+}
+
+func (t *sqlTable) blockUnsafeMutation(q Query) bool {
+	if q.Unsafe {
+		return false
+	}
+	if !t.safeWriteEnabled() {
+		return false
+	}
+	if q.RawWhere != "" {
+		return false
+	}
+	_, isTrue := q.Filter.(TrueExpr)
+	return isTrue
+}
+
+func (t *sqlTable) safeWriteEnabled() bool {
+	if t.base == nil || t.base.inst == nil || t.base.inst.Config.Setting == nil {
+		return true
+	}
+	raw, ok := t.base.inst.Config.Setting["safeWrite"]
+	if !ok {
+		return true
+	}
+	on, yes := parseBool(raw)
+	if yes {
+		return on
+	}
+	return true
+}
+
+func (t *sqlTable) hasCollectionUpdate(input Map) bool {
+	if input == nil {
+		return false
+	}
+	_, push := input[UpdPush]
+	_, pull := input[UpdPull]
+	_, add := input[UpdAddToSet]
+	return push || pull || add
+}
+
+func (t *sqlTable) updateByEntityLoop(sets Map, q Query) (int64, error) {
+	items, err := t.sqlView.queryWithQuery(q)
+	if err != nil {
+		return 0, wrapErr(t.name+".update.loop.query", ErrInvalidQuery, err)
+	}
+	if len(items) == 0 {
+		return 0, nil
+	}
+	affected := int64(0)
+	err = t.base.Tx(func(db DataBase) error {
+		tb := db.Table(t.name)
+		for _, item := range items {
+			_ = tb.Change(item, sets)
+			if db.Error() != nil {
+				return db.Error()
+			}
+			affected++
+		}
+		return nil
+	})
+	return affected, err
 }

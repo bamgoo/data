@@ -3,6 +3,7 @@ package data
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ var (
 	statsRegistry sync.Map
 	cacheRegistry sync.Map
 	cacheVersion  sync.Map
+	cacheTableVer sync.Map
 )
 
 func statsFor(name string) *moduleStats {
@@ -97,6 +99,65 @@ func cacheVersionGet(name string) uint64 {
 
 func cacheVersionBump(name string) {
 	cacheVersionPtr(name).Add(1)
+}
+
+func cacheTableMap(name string) *sync.Map {
+	if name == "" {
+		name = "default"
+	}
+	if v, ok := cacheTableVer.Load(name); ok {
+		return v.(*sync.Map)
+	}
+	m := &sync.Map{}
+	actual, _ := cacheTableVer.LoadOrStore(name, m)
+	return actual.(*sync.Map)
+}
+
+func cacheTableVersionPtr(name, table string) *atomic.Uint64 {
+	table = normalizeCacheTable(table)
+	tables := cacheTableMap(name)
+	if v, ok := tables.Load(table); ok {
+		return v.(*atomic.Uint64)
+	}
+	p := &atomic.Uint64{}
+	actual, _ := tables.LoadOrStore(table, p)
+	return actual.(*atomic.Uint64)
+}
+
+func cacheTableVersionGet(name, table string) uint64 {
+	return cacheTableVersionPtr(name, table).Load()
+}
+
+func cacheTouchTable(name, table string) {
+	cacheTableVersionPtr(name, table).Add(1)
+}
+
+func normalizeCacheTable(table string) string {
+	t := strings.TrimSpace(strings.ToLower(table))
+	if t == "" {
+		return "*"
+	}
+	return t
+}
+
+func cacheToken(name string, tables []string) string {
+	uniq := make(map[string]struct{}, len(tables))
+	list := make([]string, 0, len(tables))
+	for _, table := range tables {
+		key := normalizeCacheTable(table)
+		if _, ok := uniq[key]; ok {
+			continue
+		}
+		uniq[key] = struct{}{}
+		list = append(list, key)
+	}
+	sort.Strings(list)
+	parts := make([]string, 0, len(list)+1)
+	parts = append(parts, fmt.Sprintf("g:%d", cacheVersionGet(name)))
+	for _, key := range list {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, cacheTableVersionGet(name, key)))
+	}
+	return strings.Join(parts, "|")
 }
 
 func cloneMaps(items []Map) []Map {

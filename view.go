@@ -23,25 +23,29 @@ type sqlView struct {
 
 var sqlPlanCache sync.Map
 
-func (v *sqlView) Count(args ...Any) (int64, error) {
+func (v *sqlView) Count(args ...Any) int64 {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return 0, wrapErr(v.name+".count.parse", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".count.parse", ErrInvalidQuery, err))
+		return 0
 	}
 	if total, ok := v.loadCountCache(q); ok {
 		statsFor(v.base.inst.Name).CacheHit.Add(1)
-		return total, nil
+		v.base.setError(nil)
+		return total
 	}
 	builder := NewSQLBuilder(v.base.conn.Dialect())
 	from, joins, err := v.buildFrom(q, builder)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
-		return 0, wrapErr(v.name+".count.from", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".count.from", ErrInvalidQuery, err))
+		return 0
 	}
 	where, params, err := builder.CompileWhere(q)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
-		return 0, wrapErr(v.name+".count.where", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".count.where", ErrInvalidQuery, err))
+		return 0
 	}
 	sql := "SELECT COUNT(1) FROM " + from + joins + " WHERE " + where
 	if len(q.Group) > 0 {
@@ -52,67 +56,83 @@ func (v *sqlView) Count(args ...Any) (int64, error) {
 	err = v.base.currentExec().QueryRowContext(context.Background(), sql, toInterfaces(params)...).Scan(&total)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
-		return 0, wrapErr(v.name+".count.query", ErrInvalidQuery, classifySQLError(err))
+		v.base.setError(wrapErr(v.name+".count.query", ErrInvalidQuery, classifySQLError(err)))
+		return 0
 	}
 	v.base.logSlow(sql, params, start)
 	statsFor(v.base.inst.Name).Queries.Add(1)
 	v.storeCountCache(q, total)
-	return total, nil
+	v.base.setError(nil)
+	return total
 }
 
-func (v *sqlView) First(args ...Any) (Map, error) {
+func (v *sqlView) First(args ...Any) Map {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return nil, wrapErr(v.name+".first.parse", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".first.parse", ErrInvalidQuery, err))
+		return nil
 	}
 	q.Limit = 1
 	items, err := v.queryWithQuery(q)
 	if err != nil {
-		return nil, wrapErr(v.name+".first.query", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".first.query", ErrInvalidQuery, err))
+		return nil
 	}
 	if len(items) == 0 {
-		return nil, nil
+		v.base.setError(nil)
+		return nil
 	}
 	if len(q.Aggs) > 0 || len(q.Group) > 0 {
-		return items[0], nil
+		v.base.setError(nil)
+		return items[0]
 	}
-	return v.decode(items[0])
+	out, err := v.decode(items[0])
+	v.base.setError(err)
+	return out
 }
 
-func (v *sqlView) Query(args ...Any) ([]Map, error) {
+func (v *sqlView) Query(args ...Any) []Map {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return nil, wrapErr(v.name+".query.parse", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".query.parse", ErrInvalidQuery, err))
+		return nil
 	}
 	items, err := v.queryWithQuery(q)
 	if err != nil {
-		return nil, wrapErr(v.name+".query.run", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".query.run", ErrInvalidQuery, err))
+		return nil
 	}
 	if len(q.Aggs) > 0 || len(q.Group) > 0 {
-		return items, nil
+		v.base.setError(nil)
+		return items
 	}
 	out := make([]Map, 0, len(items))
 	for _, item := range items {
 		dec, err := v.decode(item)
 		if err != nil {
 			statsFor(v.base.inst.Name).Errors.Add(1)
-			return nil, wrapErr(v.name+".query.decode", ErrInvalidQuery, err)
+			v.base.setError(wrapErr(v.name+".query.decode", ErrInvalidQuery, err))
+			return nil
 		}
 		out = append(out, dec)
 	}
-	return out, nil
+	v.base.setError(nil)
+	return out
 }
 
-func (v *sqlView) Aggregate(args ...Any) ([]Map, error) {
+func (v *sqlView) Aggregate(args ...Any) []Map {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return nil, wrapErr(v.name+".agg.parse", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".agg.parse", ErrInvalidQuery, err))
+		return nil
 	}
 	if len(q.Aggs) == 0 {
 		// default aggregate: count
 		q.Aggs = []Agg{{Alias: "$count", Op: "count", Field: "*"}}
 	}
-	return v.queryWithQuery(q)
+	items, err := v.queryWithQuery(q)
+	v.base.setError(err)
+	return items
 }
 
 func (v *sqlView) Range(next RangeFunc, args ...Any) Res {
@@ -139,33 +159,33 @@ func (v *sqlView) LimitRange(limit int64, next RangeFunc, args ...Any) Res {
 	return res
 }
 
-func (v *sqlView) Limit(offset, limit int64, args ...Any) (int64, []Map, error) {
+func (v *sqlView) Limit(offset, limit int64, args ...Any) (int64, []Map) {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return 0, nil, wrapErr(v.name+".limit.parse", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".limit.parse", ErrInvalidQuery, err))
+		return 0, nil
 	}
 	q.Offset = offset
 	q.Limit = limit
 	total := int64(-1)
 	if q.WithCount {
-		total, err = v.Count(args...)
-		if err != nil {
-			return 0, nil, wrapErr(v.name+".limit.count", ErrInvalidQuery, err)
+		total = v.Count(args...)
+		if v.base.Error() != nil {
+			v.base.setError(wrapErr(v.name+".limit.count", ErrInvalidQuery, v.base.Error()))
+			return 0, nil
 		}
 	}
-	items, err := v.Query(withQuery(args, q)...)
-	if err != nil {
-		return 0, nil, wrapErr(v.name+".limit.query", ErrInvalidQuery, err)
+	items := v.Query(withQuery(args, q)...)
+	if v.base.Error() != nil {
+		v.base.setError(wrapErr(v.name+".limit.query", ErrInvalidQuery, v.base.Error()))
+		return 0, nil
 	}
-	return total, items, nil
+	return total, items
 }
 
-func (v *sqlView) Page(offset, limit int64, args ...Any) (PageResult, error) {
-	total, items, err := v.Limit(offset, limit, args...)
-	if err != nil {
-		return PageResult{}, err
-	}
-	return PageResult{Offset: offset, Limit: limit, Total: total, Items: items}, nil
+func (v *sqlView) Page(offset, limit int64, args ...Any) PageResult {
+	total, items := v.Limit(offset, limit, args...)
+	return PageResult{Offset: offset, Limit: limit, Total: total, Items: items}
 }
 
 func withQuery(args []Any, q Query) []Any {
@@ -188,20 +208,23 @@ func withQuery(args []Any, q Query) []Any {
 	return filtered
 }
 
-func (v *sqlView) Group(field string, args ...Any) ([]Map, error) {
+func (v *sqlView) Group(field string, args ...Any) []Map {
 	q, err := ParseQuery(args...)
 	if err != nil {
-		return nil, wrapErr(v.name+".group.parse", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".group.parse", ErrInvalidQuery, err))
+		return nil
 	}
 	q.Group = []string{field}
 	builder := NewSQLBuilder(v.base.conn.Dialect())
 	from, joins, err := v.buildFrom(q, builder)
 	if err != nil {
-		return nil, wrapErr(v.name+".group.from", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".group.from", ErrInvalidQuery, err))
+		return nil
 	}
 	where, params, err := builder.CompileWhere(q)
 	if err != nil {
-		return nil, wrapErr(v.name+".group.where", ErrInvalidQuery, err)
+		v.base.setError(wrapErr(v.name+".group.where", ErrInvalidQuery, err))
+		return nil
 	}
 	groupField := quoteField(v.base.conn.Dialect(), field)
 	sql := "SELECT " + groupField + " AS " + v.base.conn.Dialect().Quote(field) + ", COUNT(1) AS " + v.base.conn.Dialect().Quote("$count") +
@@ -210,17 +233,20 @@ func (v *sqlView) Group(field string, args ...Any) ([]Map, error) {
 	rows, err := v.base.currentExec().QueryContext(context.Background(), sql, toInterfaces(params)...)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
-		return nil, wrapErr(v.name+".group.query", ErrInvalidQuery, classifySQLError(err))
+		v.base.setError(wrapErr(v.name+".group.query", ErrInvalidQuery, classifySQLError(err)))
+		return nil
 	}
 	defer rows.Close()
 	items, err := scanMaps(rows)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
-		return nil, wrapErr(v.name+".group.scan", ErrInvalidQuery, classifySQLError(err))
+		v.base.setError(wrapErr(v.name+".group.scan", ErrInvalidQuery, classifySQLError(err)))
+		return nil
 	}
 	statsFor(v.base.inst.Name).Queries.Add(1)
 	v.base.logSlow(sql, params, start)
-	return items, nil
+	v.base.setError(nil)
+	return items
 }
 
 func (v *sqlView) queryWithQuery(q Query) ([]Map, error) {
@@ -432,14 +458,30 @@ func (v *sqlView) buildFrom(q Query, builder *SQLBuilder) (string, string, error
 		return from, "", nil
 	}
 	parts := make([]string, 0, len(q.Joins))
+	aliasSet := map[string]struct{}{}
+	aliasSet[strings.ToLower(strings.TrimSpace(v.source))] = struct{}{}
+	aliasSet[strings.ToLower(strings.TrimSpace(v.name))] = struct{}{}
 	for _, j := range q.Joins {
 		alias := j.Alias
 		if alias == "" {
 			alias = j.From
 		}
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			return "", "", fmt.Errorf("join %s invalid alias", j.From)
+		}
+		if _, exists := aliasSet[strings.ToLower(alias)]; exists {
+			return "", "", fmt.Errorf("join alias duplicated: %s", alias)
+		}
+		aliasSet[strings.ToLower(alias)] = struct{}{}
 		joinType := strings.ToUpper(strings.TrimSpace(j.Type))
 		if joinType == "" {
 			joinType = "LEFT"
+		}
+		switch joinType {
+		case "LEFT", "RIGHT", "INNER", "FULL":
+		default:
+			return "", "", fmt.Errorf("join %s invalid type: %s", j.From, joinType)
 		}
 		on := ""
 		if j.LocalField != "" && j.ForeignField != "" {
@@ -480,7 +522,8 @@ func (v *sqlView) loadQueryCache(q Query) ([]Map, bool) {
 	if !v.base.cacheEnabled() {
 		return nil, false
 	}
-	key := fmt.Sprintf("q:%d:%s", cacheVersionGet(v.base.inst.Name), makeCacheKey(v.base, v.name, q))
+	token := cacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := fmt.Sprintf("q:%s:%s", token, makeCacheKey(v.base, v.name, q))
 	raw, ok := cacheMap(v.base.inst.Name).Load(key)
 	if !ok {
 		return nil, false
@@ -504,7 +547,8 @@ func (v *sqlView) storeQueryCache(q Query, items []Map) {
 	if ttl <= 0 {
 		return
 	}
-	key := fmt.Sprintf("q:%d:%s", cacheVersionGet(v.base.inst.Name), makeCacheKey(v.base, v.name, q))
+	token := cacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := fmt.Sprintf("q:%s:%s", token, makeCacheKey(v.base, v.name, q))
 	cacheMap(v.base.inst.Name).Store(key, cacheValue{
 		expireAt: time.Now().Add(ttl).UnixNano(),
 		items:    cloneMaps(items),
@@ -516,7 +560,8 @@ func (v *sqlView) loadCountCache(q Query) (int64, bool) {
 	if !v.base.cacheEnabled() {
 		return 0, false
 	}
-	key := fmt.Sprintf("c:%d:%s", cacheVersionGet(v.base.inst.Name), makeCacheKey(v.base, v.name, q))
+	token := cacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := fmt.Sprintf("c:%s:%s", token, makeCacheKey(v.base, v.name, q))
 	raw, ok := cacheMap(v.base.inst.Name).Load(key)
 	if !ok {
 		return 0, false
@@ -540,11 +585,23 @@ func (v *sqlView) storeCountCache(q Query, total int64) {
 	if ttl <= 0 {
 		return
 	}
-	key := fmt.Sprintf("c:%d:%s", cacheVersionGet(v.base.inst.Name), makeCacheKey(v.base, v.name, q))
+	token := cacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := fmt.Sprintf("c:%s:%s", token, makeCacheKey(v.base, v.name, q))
 	cacheMap(v.base.inst.Name).Store(key, cacheValue{
 		expireAt: time.Now().Add(ttl).UnixNano(),
 		total:    total,
 	})
+}
+
+func (v *sqlView) cacheTables(q Query) []string {
+	out := make([]string, 0, len(q.Joins)+1)
+	out = append(out, v.source)
+	for _, join := range q.Joins {
+		if strings.TrimSpace(join.From) != "" {
+			out = append(out, join.From)
+		}
+	}
+	return out
 }
 
 func (v *sqlView) applyAfter(q *Query) error {

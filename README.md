@@ -8,7 +8,7 @@ bamgoo data module with Mongo-like `Map` query DSL and SQL drivers.
 - json/array: `$contains $overlap $elemMatch`
 - logic: `$and $or $nor $not`
 - text: `$like $ilike $regex`
-- options: `$select $sort $limit $offset $after $group $having $join $agg`
+- options: `$select $sort $limit $offset $after $group $having $join $agg $withCount $unsafe`
 - options: `$withCount`
 
 ## Update DSL
@@ -20,6 +20,7 @@ bamgoo data module with Mongo-like `Map` query DSL and SQL drivers.
 - `$pull`
 - `$addToSet`
 - `$setPath`
+- `$unsetPath`
 
 ## Driver Notes
 
@@ -113,6 +114,17 @@ _ = db.Tx(func(tx data.DataBase) error {
   })
   return err
 })
+```
+
+## Safety Guard
+
+By default, full-table `Update/Delete` is blocked unless query has filter.
+
+```go
+_, err := db.Table("user").Delete(base.Map{
+  "$unsafe": true,
+})
+_ = err
 ```
 
 ## Join Field Ref

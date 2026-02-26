@@ -2,10 +2,14 @@ package data
 
 import (
 	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bamgoo/bamgoo"
@@ -29,58 +33,61 @@ type (
 		Commit() error
 		Rollback() error
 		Tx(TxFunc) error
-		Migrate(...string) error
+		Migrate(...string)
 		Capabilities() Capabilities
+		Error() error
+		ClearError()
 
 		Table(string) DataTable
 		View(string) DataView
 		Model(string) DataModel
 
-		Raw(string, ...Any) ([]Map, error)
-		Exec(string, ...Any) (int64, error)
+		Raw(string, ...Any) []Map
+		Exec(string, ...Any) int64
+		Parse(...Any) (string, []Any)
 	}
 
 	DataTable interface {
-		Create(Map) (Map, error)
-		CreateMany([]Map) ([]Map, error)
-		Upsert(Map, ...Any) (Map, error)
-		UpsertMany([]Map, ...Any) ([]Map, error)
-		Change(Map, Map) (Map, error)
-		Remove(...Any) (Map, error)
-		Update(Map, ...Any) (int64, error)
-		Delete(...Any) (int64, error)
+		Create(Map) Map
+		CreateMany([]Map) []Map
+		Upsert(Map, ...Any) Map
+		UpsertMany([]Map, ...Any) []Map
+		Change(Map, Map) Map
+		Remove(...Any) Map
+		Update(Map, ...Any) int64
+		Delete(...Any) int64
 
-		Entity(Any) (Map, error)
-		Count(...Any) (int64, error)
-		Aggregate(...Any) ([]Map, error)
-		First(...Any) (Map, error)
-		Query(...Any) ([]Map, error)
+		Entity(Any) Map
+		Count(...Any) int64
+		Aggregate(...Any) []Map
+		First(...Any) Map
+		Query(...Any) []Map
 		Range(RangeFunc, ...Any) Res
 		LimitRange(int64, RangeFunc, ...Any) Res
-		Limit(offset, limit int64, args ...Any) (int64, []Map, error)
-		Page(offset, limit int64, args ...Any) (PageResult, error)
-		Group(field string, args ...Any) ([]Map, error)
+		Limit(offset, limit int64, args ...Any) (int64, []Map)
+		Page(offset, limit int64, args ...Any) PageResult
+		Group(field string, args ...Any) []Map
 	}
 
 	DataView interface {
-		Count(...Any) (int64, error)
-		Aggregate(...Any) ([]Map, error)
-		First(...Any) (Map, error)
-		Query(...Any) ([]Map, error)
+		Count(...Any) int64
+		Aggregate(...Any) []Map
+		First(...Any) Map
+		Query(...Any) []Map
 		Range(RangeFunc, ...Any) Res
 		LimitRange(int64, RangeFunc, ...Any) Res
-		Limit(offset, limit int64, args ...Any) (int64, []Map, error)
-		Page(offset, limit int64, args ...Any) (PageResult, error)
-		Group(field string, args ...Any) ([]Map, error)
+		Limit(offset, limit int64, args ...Any) (int64, []Map)
+		Page(offset, limit int64, args ...Any) PageResult
+		Group(field string, args ...Any) []Map
 	}
 
 	DataModel interface {
-		First(...Any) (Map, error)
-		Query(...Any) ([]Map, error)
+		First(...Any) Map
+		Query(...Any) []Map
 		Range(RangeFunc, ...Any) Res
 		LimitRange(int64, RangeFunc, ...Any) Res
-		Limit(offset, limit int64, args ...Any) (int64, []Map, error)
-		Page(offset, limit int64, args ...Any) (PageResult, error)
+		Limit(offset, limit int64, args ...Any) (int64, []Map)
+		Page(offset, limit int64, args ...Any) PageResult
 	}
 )
 
@@ -89,6 +96,8 @@ type sqlBase struct {
 	conn   Connection
 	tx     *sql.Tx
 	closed bool
+	mutex  sync.RWMutex
+	err    error
 }
 
 type invalidDataBase struct {
@@ -111,6 +120,9 @@ func (m *Module) Base(names ...string) DataBase {
 	if inst == nil {
 		return &invalidDataBase{err: errInvalidConnection}
 	}
+	if provider, ok := inst.conn.(interface{ Base(*Instance) DataBase }); ok {
+		return provider.Base(inst)
+	}
 	return &sqlBase{inst: inst, conn: inst.conn}
 }
 
@@ -124,6 +136,24 @@ func (b *sqlBase) Close() error {
 	}
 	b.closed = true
 	return nil
+}
+
+func (b *sqlBase) Error() error {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+	return b.err
+}
+
+func (b *sqlBase) ClearError() {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.err = nil
+}
+
+func (b *sqlBase) setError(err error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.err = err
 }
 
 func (b *sqlBase) Begin() error {
@@ -187,7 +217,11 @@ func (b *sqlBase) Capabilities() Capabilities {
 	return detectCapabilities(b.conn.Dialect())
 }
 
-func (b *sqlBase) Migrate(names ...string) error {
+func (b *sqlBase) Migrate(names ...string) {
+	if err := b.ensureMigrateMetaTable(); err != nil {
+		b.setError(wrapErr("migrate.meta", ErrInvalidQuery, err))
+		return
+	}
 	targets := names
 	if len(targets) == 0 {
 		targets = make([]string, 0, len(module.tables))
@@ -202,11 +236,26 @@ func (b *sqlBase) Migrate(names ...string) error {
 		}
 		schema := pickSchema(b.inst, cfg.Schema)
 		source := pickName(name, cfg.Table)
-		if err := b.migrateTable(schema, source, pickKey(cfg.Key), cfg.Fields, cfg.Setting); err != nil {
-			return wrapErr("migrate."+name, ErrInvalidQuery, err)
+		sig := migrateSignature(cfg)
+		applied, err := b.migrateAlreadyApplied(name, sig)
+		if err != nil {
+			b.setError(wrapErr("migrate."+name+".check", ErrInvalidQuery, err))
+			return
+		}
+		if applied {
+			continue
+		}
+		if err := b.migrateTable(schema, source, pickKey(cfg.Key), cfg.Fields, cfg.Indexes, cfg.Setting); err != nil {
+			b.setError(wrapErr("migrate."+name, ErrInvalidQuery, err))
+			return
+		}
+		cacheTouchTable(b.inst.Name, source)
+		if err := b.markMigrated(name, sig); err != nil {
+			b.setError(wrapErr("migrate."+name+".mark", ErrInvalidQuery, err))
+			return
 		}
 	}
-	return nil
+	b.setError(nil)
 }
 
 func (b *sqlBase) Table(name string) DataTable {
@@ -278,30 +327,34 @@ type execer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func (b *sqlBase) Raw(query string, args ...Any) ([]Map, error) {
+func (b *sqlBase) Raw(query string, args ...Any) []Map {
 	start := time.Now()
 	rows, err := b.currentExec().QueryContext(context.Background(), query, toInterfaces(args)...)
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
-		return nil, wrapErr("raw.query", ErrInvalidQuery, classifySQLError(err))
+		b.setError(wrapErr("raw.query", ErrInvalidQuery, classifySQLError(err)))
+		return nil
 	}
 	defer rows.Close()
 	items, err := scanMaps(rows)
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
-		return nil, wrapErr("raw.scan", ErrInvalidQuery, classifySQLError(err))
+		b.setError(wrapErr("raw.scan", ErrInvalidQuery, classifySQLError(err)))
+		return nil
 	}
 	statsFor(b.inst.Name).Queries.Add(1)
 	b.logSlow(query, args, start)
-	return items, nil
+	b.setError(nil)
+	return items
 }
 
-func (b *sqlBase) Exec(query string, args ...Any) (int64, error) {
+func (b *sqlBase) Exec(query string, args ...Any) int64 {
 	start := time.Now()
 	res, err := b.currentExec().ExecContext(context.Background(), query, toInterfaces(args)...)
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
-		return 0, wrapErr("exec", ErrInvalidQuery, classifySQLError(err))
+		b.setError(wrapErr("exec", ErrInvalidQuery, classifySQLError(err)))
+		return 0
 	}
 	b.logSlow(query, args, start)
 	statsFor(b.inst.Name).Writes.Add(1)
@@ -309,9 +362,27 @@ func (b *sqlBase) Exec(query string, args ...Any) (int64, error) {
 	affected, err := res.RowsAffected()
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
-		return 0, wrapErr("exec.rows", ErrInvalidQuery, classifySQLError(err))
+		b.setError(wrapErr("exec.rows", ErrInvalidQuery, classifySQLError(err)))
+		return 0
 	}
-	return affected, nil
+	b.setError(nil)
+	return affected
+}
+
+func (b *sqlBase) Parse(args ...Any) (string, []Any) {
+	q, err := ParseQuery(args...)
+	if err != nil {
+		b.setError(wrapErr("parse.query", ErrInvalidQuery, err))
+		return "", nil
+	}
+	builder := NewSQLBuilder(b.conn.Dialect())
+	where, params, err := builder.CompileWhere(q)
+	if err != nil {
+		b.setError(wrapErr("parse.where", ErrInvalidQuery, err))
+		return "", nil
+	}
+	b.setError(nil)
+	return where, params
 }
 
 func toInterfaces(args []Any) []any {
@@ -386,7 +457,7 @@ func mapChange(fields Vars, val Map) (Map, error) {
 	return out, nil
 }
 
-func (b *sqlBase) migrateTable(schema, table, key string, fields Vars, setting Map) error {
+func (b *sqlBase) migrateTable(schema, table, key string, fields Vars, indexes []Index, setting Map) error {
 	d := b.conn.Dialect()
 	source := b.sourceExpr(schema, table)
 	cols := make([]string, 0, len(fields)+1)
@@ -422,47 +493,65 @@ func (b *sqlBase) migrateTable(schema, table, key string, fields Vars, setting M
 	if _, err := b.currentExec().ExecContext(context.Background(), sqlText); err != nil {
 		return err
 	}
-	return b.migrateIndexes(schema, table, setting)
+	return b.migrateIndexes(schema, table, indexes, setting)
 }
 
-func (b *sqlBase) migrateIndexes(schema, table string, setting Map) error {
-	if setting == nil {
-		return nil
-	}
-	raw, ok := setting["indexes"]
-	if !ok {
-		return nil
-	}
-	indexes := make([]Map, 0)
-	switch vv := raw.(type) {
-	case []Map:
-		indexes = append(indexes, vv...)
-	case []Any:
-		for _, one := range vv {
-			if m, ok := one.(Map); ok {
-				indexes = append(indexes, m)
+func (b *sqlBase) migrateIndexes(schema, table string, indexes []Index, setting Map) error {
+	items := make([]Index, 0, len(indexes)+2)
+	items = append(items, indexes...)
+	// backward compatibility: allow indexes in table.setting
+	if setting != nil {
+		raw, ok := setting["indexes"]
+		if ok {
+			switch vv := raw.(type) {
+			case []Map:
+				for _, one := range vv {
+					fields := parseStringList(one["fields"])
+					if len(fields) == 0 {
+						continue
+					}
+					name, _ := one["name"].(string)
+					unique, _ := parseBool(one["unique"])
+					items = append(items, Index{Name: strings.TrimSpace(name), Fields: fields, Unique: unique})
+				}
+			case []Any:
+				for _, rawOne := range vv {
+					one, ok := rawOne.(Map)
+					if !ok {
+						continue
+					}
+					fields := parseStringList(one["fields"])
+					if len(fields) == 0 {
+						continue
+					}
+					name, _ := one["name"].(string)
+					unique, _ := parseBool(one["unique"])
+					items = append(items, Index{Name: strings.TrimSpace(name), Fields: fields, Unique: unique})
+				}
+			case Map:
+				fields := parseStringList(vv["fields"])
+				if len(fields) > 0 {
+					name, _ := vv["name"].(string)
+					unique, _ := parseBool(vv["unique"])
+					items = append(items, Index{Name: strings.TrimSpace(name), Fields: fields, Unique: unique})
+				}
 			}
 		}
-	case Map:
-		indexes = append(indexes, vv)
 	}
-	if len(indexes) == 0 {
+	if len(items) == 0 {
 		return nil
 	}
 	d := b.conn.Dialect()
-	for i, idx := range indexes {
-		fields := parseStringList(idx["fields"])
+	for i, idx := range items {
+		fields := idx.Fields
 		if len(fields) == 0 {
 			continue
 		}
-		name := ""
-		if v, ok := idx["name"].(string); ok {
-			name = strings.TrimSpace(v)
-		}
+		name := strings.TrimSpace(idx.Name)
 		if name == "" {
 			name = fmt.Sprintf("idx_%s_%d", table, i+1)
 		}
-		unique, _ := parseBool(idx["unique"])
+		unique := idx.Unique
 		parts := make([]string, 0, len(fields))
 		for _, f := range fields {
 			parts = append(parts, d.Quote(f))
@@ -547,36 +636,101 @@ func migrateType(dialect, typ string) string {
 	}
 }
 
-func (b *invalidDataBase) Close() error                       { return nil }
-func (b *invalidDataBase) Begin() error                       { return b.err }
-func (b *invalidDataBase) Commit() error                      { return b.err }
-func (b *invalidDataBase) Rollback() error                    { return b.err }
-func (b *invalidDataBase) Tx(TxFunc) error                    { return b.err }
-func (b *invalidDataBase) Migrate(...string) error            { return b.err }
-func (b *invalidDataBase) Capabilities() Capabilities         { return Capabilities{} }
-func (b *invalidDataBase) Table(string) DataTable             { return &invalidTable{err: b.err} }
-func (b *invalidDataBase) View(string) DataView               { return &invalidTable{err: b.err} }
-func (b *invalidDataBase) Model(string) DataModel             { return &invalidTable{err: b.err} }
-func (b *invalidDataBase) Raw(string, ...Any) ([]Map, error)  { return nil, b.err }
-func (b *invalidDataBase) Exec(string, ...Any) (int64, error) { return 0, b.err }
+func migrateSignature(cfg Table) string {
+	payload, _ := json.Marshal(struct {
+		Key     string  `json:"key"`
+		Fields  Vars    `json:"fields"`
+		Indexes []Index `json:"indexes"`
+		Setting Map     `json:"setting"`
+	}{
+		Key:     cfg.Key,
+		Fields:  cfg.Fields,
+		Indexes: cfg.Indexes,
+		Setting: cfg.Setting,
+	})
+	sum := sha1.Sum(payload)
+	return hex.EncodeToString(sum[:])
+}
 
-func (t *invalidTable) Create(Map) (Map, error)                 { return nil, t.err }
-func (t *invalidTable) CreateMany([]Map) ([]Map, error)         { return nil, t.err }
-func (t *invalidTable) Upsert(Map, ...Any) (Map, error)         { return nil, t.err }
-func (t *invalidTable) UpsertMany([]Map, ...Any) ([]Map, error) { return nil, t.err }
-func (t *invalidTable) Change(Map, Map) (Map, error)            { return nil, t.err }
-func (t *invalidTable) Remove(...Any) (Map, error)              { return nil, t.err }
-func (t *invalidTable) Update(Map, ...Any) (int64, error)       { return 0, t.err }
-func (t *invalidTable) Delete(...Any) (int64, error)            { return 0, t.err }
-func (t *invalidTable) Entity(Any) (Map, error)                 { return nil, t.err }
-func (t *invalidTable) Count(...Any) (int64, error)             { return 0, t.err }
-func (t *invalidTable) Aggregate(...Any) ([]Map, error)         { return nil, t.err }
-func (t *invalidTable) First(...Any) (Map, error)               { return nil, t.err }
-func (t *invalidTable) Query(...Any) ([]Map, error)             { return nil, t.err }
-func (t *invalidTable) Range(RangeFunc, ...Any) Res             { return bamgoo.Fail.With(t.err.Error()) }
+func (b *sqlBase) ensureMigrateMetaTable() error {
+	sqlText := "CREATE TABLE IF NOT EXISTS _bamgoo_migrations (name TEXT PRIMARY KEY, signature TEXT NOT NULL, updated_at TIMESTAMP NOT NULL)"
+	if strings.Contains(strings.ToLower(b.conn.Dialect().Name()), "mysql") {
+		sqlText = "CREATE TABLE IF NOT EXISTS _bamgoo_migrations (`name` VARCHAR(191) PRIMARY KEY, `signature` VARCHAR(64) NOT NULL, `updated_at` TIMESTAMP NOT NULL)"
+	}
+	_, err := b.currentExec().ExecContext(context.Background(), sqlText)
+	return err
+}
+
+func (b *sqlBase) migrateAlreadyApplied(name, signature string) (bool, error) {
+	d := b.conn.Dialect()
+	query := "SELECT signature FROM _bamgoo_migrations WHERE " + d.Quote("name") + " = " + d.Placeholder(1)
+	var current string
+	err := b.currentExec().QueryRowContext(context.Background(), query, name).Scan(&current)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return current == signature, nil
+}
+
+func (b *sqlBase) markMigrated(name, signature string) error {
+	d := strings.ToLower(b.conn.Dialect().Name())
+	now := time.Now()
+	if d == "pgsql" || d == "postgres" {
+		_, err := b.currentExec().ExecContext(context.Background(),
+			"INSERT INTO _bamgoo_migrations(name,signature,updated_at) VALUES($1,$2,$3) ON CONFLICT(name) DO UPDATE SET signature=EXCLUDED.signature, updated_at=EXCLUDED.updated_at",
+			name, signature, now)
+		return err
+	}
+	if d == "sqlite" {
+		_, err := b.currentExec().ExecContext(context.Background(),
+			"INSERT INTO _bamgoo_migrations(name,signature,updated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET signature=excluded.signature, updated_at=excluded.updated_at",
+			name, signature, now)
+		return err
+	}
+	_, err := b.currentExec().ExecContext(context.Background(),
+		"INSERT INTO _bamgoo_migrations(name,signature,updated_at) VALUES(?,?,?) ON DUPLICATE KEY UPDATE signature=VALUES(signature), updated_at=VALUES(updated_at)",
+		name, signature, now)
+	return err
+}
+
+func (b *invalidDataBase) Close() error               { return nil }
+func (b *invalidDataBase) Begin() error               { return b.err }
+func (b *invalidDataBase) Commit() error              { return b.err }
+func (b *invalidDataBase) Rollback() error            { return b.err }
+func (b *invalidDataBase) Tx(TxFunc) error            { return b.err }
+func (b *invalidDataBase) Migrate(...string)          {}
+func (b *invalidDataBase) Capabilities() Capabilities { return Capabilities{} }
+func (b *invalidDataBase) Error() error               { return b.err }
+func (b *invalidDataBase) ClearError()                {}
+func (b *invalidDataBase) Table(string) DataTable     { return &invalidTable{err: b.err} }
+func (b *invalidDataBase) View(string) DataView       { return &invalidTable{err: b.err} }
+func (b *invalidDataBase) Model(string) DataModel     { return &invalidTable{err: b.err} }
+func (b *invalidDataBase) Raw(string, ...Any) []Map   { return nil }
+func (b *invalidDataBase) Exec(string, ...Any) int64  { return 0 }
+func (b *invalidDataBase) Parse(...Any) (string, []Any) {
+	return "", nil
+}
+
+func (t *invalidTable) Create(Map) Map                 { return nil }
+func (t *invalidTable) CreateMany([]Map) []Map         { return nil }
+func (t *invalidTable) Upsert(Map, ...Any) Map         { return nil }
+func (t *invalidTable) UpsertMany([]Map, ...Any) []Map { return nil }
+func (t *invalidTable) Change(Map, Map) Map            { return nil }
+func (t *invalidTable) Remove(...Any) Map              { return nil }
+func (t *invalidTable) Update(Map, ...Any) int64       { return 0 }
+func (t *invalidTable) Delete(...Any) int64            { return 0 }
+func (t *invalidTable) Entity(Any) Map                 { return nil }
+func (t *invalidTable) Count(...Any) int64             { return 0 }
+func (t *invalidTable) Aggregate(...Any) []Map         { return nil }
+func (t *invalidTable) First(...Any) Map               { return nil }
+func (t *invalidTable) Query(...Any) []Map             { return nil }
+func (t *invalidTable) Range(RangeFunc, ...Any) Res    { return bamgoo.Fail.With(t.err.Error()) }
 func (t *invalidTable) LimitRange(int64, RangeFunc, ...Any) Res {
 	return bamgoo.Fail.With(t.err.Error())
 }
-func (t *invalidTable) Limit(int64, int64, ...Any) (int64, []Map, error) { return 0, nil, t.err }
-func (t *invalidTable) Page(int64, int64, ...Any) (PageResult, error)    { return PageResult{}, t.err }
-func (t *invalidTable) Group(string, ...Any) ([]Map, error)              { return nil, t.err }
+func (t *invalidTable) Limit(int64, int64, ...Any) (int64, []Map) { return 0, nil }
+func (t *invalidTable) Page(int64, int64, ...Any) PageResult      { return PageResult{} }
+func (t *invalidTable) Group(string, ...Any) []Map                { return nil }

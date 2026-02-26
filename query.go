@@ -19,6 +19,7 @@ type (
 		Offset    int64
 		After     Map
 		WithCount bool
+		Unsafe    bool
 		Group     []string
 		Aggs      []Agg
 		Having    Expr
@@ -142,6 +143,7 @@ type queryOptions struct {
 	offset    *int64
 	after     Map
 	withCount *bool
+	unsafe    *bool
 	group     []string
 	aggs      []Agg
 	having    Expr
@@ -166,6 +168,9 @@ func mergeOptions(q *Query, opts queryOptions) {
 	}
 	if opts.withCount != nil {
 		q.WithCount = *opts.withCount
+	}
+	if opts.unsafe != nil {
+		q.Unsafe = *opts.unsafe
 	}
 	if len(opts.group) > 0 {
 		q.Group = opts.group
@@ -205,6 +210,10 @@ func parseFilterMap(m Map) (Expr, queryOptions, error) {
 			case OptWithCount:
 				if vv, ok := parseBool(val); ok {
 					opts.withCount = &vv
+				}
+			case OptUnsafe:
+				if vv, ok := parseBool(val); ok {
+					opts.unsafe = &vv
 				}
 			case OptGroup:
 				opts.group = parseStringList(val)

@@ -38,16 +38,18 @@ const (
 	OptHaving    = "$having"
 	OptJoin      = "$join"
 	OptAgg       = "$agg"
+	OptUnsafe    = "$unsafe"
 )
 
 const (
-	UpdSet      = "$set"
-	UpdInc      = "$inc"
-	UpdUnset    = "$unset"
-	UpdPush     = "$push"
-	UpdPull     = "$pull"
-	UpdAddToSet = "$addToSet"
-	UpdSetPath  = "$setPath"
+	UpdSet       = "$set"
+	UpdInc       = "$inc"
+	UpdUnset     = "$unset"
+	UpdPush      = "$push"
+	UpdPull      = "$pull"
+	UpdAddToSet  = "$addToSet"
+	UpdSetPath   = "$setPath"
+	UpdUnsetPath = "$unsetPath"
 )
 
 var (
