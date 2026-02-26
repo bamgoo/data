@@ -84,6 +84,10 @@ func GetStats(names ...string) Stats {
 	return module.Stats(names...)
 }
 
+func GetPoolStats(names ...string) []PoolStats {
+	return module.PoolStats(names...)
+}
+
 func RegisterDriver(name string, driver Driver) {
 	module.RegisterDriver(name, driver)
 }
@@ -106,6 +110,30 @@ func RegisterModel(name string, model Model) {
 
 func RegisterMigration(name string, migration Migration) {
 	module.RegisterMigration(name, migration)
+}
+
+func RegisterWatcher(name string, watcher Watcher) {
+	module.RegisterWatcher(name, watcher)
+}
+
+func RegisterWatchers(items Watchers) {
+	module.RegisterWatchers(items)
+}
+
+func RegisterInsertWatcher(name string, watcher InsertWatcher) {
+	module.RegisterInsertWatcher(name, watcher)
+}
+
+func RegisterUpdateWatcher(name string, watcher UpdateWatcher) {
+	module.RegisterUpdateWatcher(name, watcher)
+}
+
+func RegisterUpsertWatcher(name string, watcher UpsertWatcher) {
+	module.RegisterUpsertWatcher(name, watcher)
+}
+
+func RegisterDeleteWatcher(name string, watcher DeleteWatcher) {
+	module.RegisterDeleteWatcher(name, watcher)
 }
 
 func Parse(args ...Any) (Query, error) {

@@ -1,9 +1,7 @@
 package data
 
 import (
-	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -163,7 +161,9 @@ func (v *sqlView) Count(args ...Any) int64 {
 	}
 	start := time.Now()
 	var total int64
-	err = v.base.currentExec().QueryRowContext(context.Background(), sql, toInterfaces(params)...).Scan(&total)
+	ctx, cancel := v.base.opContext(15 * time.Second)
+	defer cancel()
+	err = v.base.currentExec().QueryRowContext(ctx, sql, toInterfaces(params)...).Scan(&total)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
 		v.base.setError(wrapErr(v.name+".count.query", ErrInvalidQuery, classifySQLError(err)))
@@ -265,6 +265,44 @@ func (v *sqlView) ScanN(limit int64, next ScanFunc, args ...Any) Res {
 		q.Limit = limit
 	}
 	q = v.mapQueryToStorage(q)
+	batch := q.Batch
+	if batch <= 0 {
+		batch = v.base.scanBatchSize()
+	}
+	if batch > 0 {
+		offset := q.Offset
+		remain := q.Limit
+		for {
+			chunk := batch
+			if remain > 0 && chunk > remain {
+				chunk = remain
+			}
+			qq := q
+			qq.Offset = offset
+			qq.Limit = chunk
+			items, err := v.queryWithQuery(qq)
+			if err != nil {
+				return bamgoo.Fail.With(err.Error())
+			}
+			for _, item := range items {
+				if res := next(item); res != nil && res.Fail() {
+					return res
+				}
+			}
+			if len(items) == 0 || int64(len(items)) < chunk {
+				break
+			}
+			offset += int64(len(items))
+			if remain > 0 {
+				remain -= int64(len(items))
+				if remain <= 0 {
+					break
+				}
+			}
+		}
+		v.base.setError(nil)
+		return bamgoo.OK
+	}
 
 	res := v.streamWithQuery(q, next)
 	if res == nil {
@@ -344,7 +382,9 @@ func (v *sqlView) Group(field string, args ...Any) []Map {
 	}
 	sql += orderBy
 	start := time.Now()
-	rows, err := v.base.currentExec().QueryContext(context.Background(), sql, toInterfaces(params)...)
+	ctx, cancel := v.base.opContext(30 * time.Second)
+	defer cancel()
+	rows, err := v.base.currentExec().QueryContext(ctx, sql, toInterfaces(params)...)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
 		v.base.setError(wrapErr(v.name+".group.query", ErrInvalidQuery, classifySQLError(err)))
@@ -426,7 +466,9 @@ func (v *sqlView) queryWithQuery(q Query) ([]Map, error) {
 
 	sql = v.cacheSQL(sql, q)
 	start := time.Now()
-	rows, err := v.base.currentExec().QueryContext(context.Background(), sql, toInterfaces(params)...)
+	ctx, cancel := v.base.opContext(30 * time.Second)
+	defer cancel()
+	rows, err := v.base.currentExec().QueryContext(ctx, sql, toInterfaces(params)...)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
 		return nil, wrapErr(v.name+".query.db", ErrInvalidQuery, classifySQLError(err))
@@ -503,7 +545,9 @@ func (v *sqlView) streamWithQuery(q Query, next ScanFunc) Res {
 
 	sqlText = v.cacheSQL(sqlText, q)
 	start := time.Now()
-	rows, err := v.base.currentExec().QueryContext(context.Background(), sqlText, toInterfaces(params)...)
+	ctx, cancel := v.base.opContext(30 * time.Second)
+	defer cancel()
+	rows, err := v.base.currentExec().QueryContext(ctx, sqlText, toInterfaces(params)...)
 	if err != nil {
 		statsFor(v.base.inst.Name).Errors.Add(1)
 		return bamgoo.Fail.With(wrapErr(v.name+".range.query", ErrInvalidQuery, classifySQLError(err)).Error())
@@ -688,10 +732,7 @@ func (v *sqlView) buildJSONSortExpr(field string, path []string, dialect string)
 }
 
 func (q Query) cacheKey(dialect, name string) string {
-	keys := make([]string, 0, len(q.Select))
-	keys = append(keys, q.Select...)
-	sort.Strings(keys)
-	return fmt.Sprintf("%s|%s|%v|%v|%v|%v|%d|%d|%t", dialect, name, keys, q.Sort, q.Group, q.Aggs, q.Limit, q.Offset, q.WithCount)
+	return dialect + "|" + name + "|" + QuerySignature(q)
 }
 
 func (v *sqlView) buildFrom(q Query, builder *SQLBuilder) (string, string, error) {
@@ -776,7 +817,7 @@ func (v *sqlView) loadQueryCache(q Query) ([]Map, bool) {
 		return nil, false
 	}
 	if cv.expireAt > 0 && time.Now().UnixNano() > cv.expireAt {
-		cacheMap(v.base.inst.Name).Delete(key)
+		cacheDelete(v.base.inst.Name, key)
 		return nil, false
 	}
 	return cloneMaps(cv.items), true
@@ -792,11 +833,12 @@ func (v *sqlView) storeQueryCache(q Query, items []Map) {
 	}
 	token := cacheToken(v.base.inst.Name, v.cacheTables(q))
 	key := fmt.Sprintf("q:%s:%s", token, makeCacheKey(v.base, v.name, q))
-	cacheMap(v.base.inst.Name).Store(key, cacheValue{
+	tables := v.cacheTables(q)
+	cacheStoreWithCap(v.base.inst.Name, key, cacheValue{
 		expireAt: time.Now().Add(ttl).UnixNano(),
 		items:    cloneMaps(items),
 		total:    -1,
-	})
+	}, v.base.cacheCapacity(), tables)
 }
 
 func (v *sqlView) loadCountCache(q Query) (int64, bool) {
@@ -814,7 +856,7 @@ func (v *sqlView) loadCountCache(q Query) (int64, bool) {
 		return 0, false
 	}
 	if cv.expireAt > 0 && time.Now().UnixNano() > cv.expireAt {
-		cacheMap(v.base.inst.Name).Delete(key)
+		cacheDelete(v.base.inst.Name, key)
 		return 0, false
 	}
 	return cv.total, true
@@ -830,10 +872,11 @@ func (v *sqlView) storeCountCache(q Query, total int64) {
 	}
 	token := cacheToken(v.base.inst.Name, v.cacheTables(q))
 	key := fmt.Sprintf("c:%s:%s", token, makeCacheKey(v.base, v.name, q))
-	cacheMap(v.base.inst.Name).Store(key, cacheValue{
+	tables := v.cacheTables(q)
+	cacheStoreWithCap(v.base.inst.Name, key, cacheValue{
 		expireAt: time.Now().Add(ttl).UnixNano(),
 		total:    total,
-	})
+	}, v.base.cacheCapacity(), tables)
 }
 
 func (v *sqlView) cacheTables(q Query) []string {

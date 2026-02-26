@@ -19,6 +19,26 @@ type (
 		Workload int64
 	}
 
+	PoolStats struct {
+		Name         string  `json:"name"`
+		Driver       string  `json:"driver"`
+		Open         int     `json:"open"`
+		InUse        int     `json:"inUse"`
+		Idle         int     `json:"idle"`
+		WaitCount    int64   `json:"waitCount"`
+		WaitDuration int64   `json:"waitDurationMs"`
+		MaxOpen      int     `json:"maxOpen"`
+		Queries      int64   `json:"queries"`
+		Writes       int64   `json:"writes"`
+		Errors       int64   `json:"errors"`
+		CacheHit     int64   `json:"cacheHit"`
+		CacheRate    float64 `json:"cacheRate"`
+		Slow         int64   `json:"slow"`
+		SlowAvgMs    int64   `json:"slowAvgMs"`
+		SlowP50Ms    int64   `json:"slowP50Ms"`
+		SlowP95Ms    int64   `json:"slowP95Ms"`
+	}
+
 	Capabilities struct {
 		Dialect       string `json:"dialect"`
 		ILike         bool   `json:"ilike"`

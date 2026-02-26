@@ -39,6 +39,7 @@ const (
 	OptJoin      = "$join"
 	OptAgg       = "$agg"
 	OptUnsafe    = "$unsafe"
+	OptBatch     = "$batch"
 )
 
 const (

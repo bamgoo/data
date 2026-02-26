@@ -2,6 +2,7 @@ package data
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -11,18 +12,23 @@ import (
 )
 
 func init() {
-	bamgoo.Mount(module)
+	host = bamgoo.Mount(module)
+	registerCacheSyncService(host)
 }
 
 var module = &Module{
-	configs:    make(Configs, 0),
-	drivers:    make(map[string]Driver, 0),
-	instances:  make(map[string]*Instance, 0),
-	tables:     make(map[string]Table, 0),
-	views:      make(map[string]View, 0),
-	models:     make(map[string]Model, 0),
-	migrations: make(map[string]Migration, 0),
+	configs:     make(Configs, 0),
+	drivers:     make(map[string]Driver, 0),
+	instances:   make(map[string]*Instance, 0),
+	tables:      make(map[string]Table, 0),
+	views:       make(map[string]View, 0),
+	models:      make(map[string]Model, 0),
+	migrations:  make(map[string]Migration, 0),
+	watchers:    make(map[string]Watcher, 0),
+	dispatchers: make(map[string]*changeDispatcher, 0),
 }
+
+var host bamgoo.Host
 
 type (
 	Module struct {
@@ -32,23 +38,31 @@ type (
 		connected   bool
 		started     bool
 
-		configs    Configs
-		drivers    map[string]Driver
-		instances  map[string]*Instance
-		tables     map[string]Table
-		views      map[string]View
-		models     map[string]Model
-		migrations map[string]Migration
+		configs     Configs
+		drivers     map[string]Driver
+		instances   map[string]*Instance
+		tables      map[string]Table
+		views       map[string]View
+		models      map[string]Model
+		migrations  map[string]Migration
+		watchers    map[string]Watcher
+		dispatchers map[string]*changeDispatcher
 	}
 
 	Configs map[string]Config
 	Config  struct {
-		Driver  string
-		Url     string
-		Schema  string
-		Mapping bool
-		Migrate MigrateOptions
-		Setting Map
+		Driver      string
+		Url         string
+		Schema      string
+		Mapping     bool
+		MaxOpen     int
+		MaxIdle     int
+		MaxLifetime time.Duration
+		MaxIdleTime time.Duration
+		ReadOnly    bool
+		Watcher     Map
+		Migrate     MigrateOptions
+		Setting     Map
 	}
 
 	Instance struct {
@@ -76,6 +90,18 @@ func (m *Module) Register(name string, value Any) {
 		m.RegisterModel(name, v)
 	case Migration:
 		m.RegisterMigration(name, v)
+	case Watcher:
+		m.RegisterWatcher(name, v)
+	case Watchers:
+		m.RegisterWatchers(v)
+	case InsertWatcher:
+		m.RegisterInsertWatcher(name, v)
+	case UpdateWatcher:
+		m.RegisterUpdateWatcher(name, v)
+	case UpsertWatcher:
+		m.RegisterUpsertWatcher(name, v)
+	case DeleteWatcher:
+		m.RegisterDeleteWatcher(name, v)
 	}
 }
 
@@ -221,6 +247,69 @@ func (m *Module) configure(name string, cfg Map) {
 			out.Mapping = vv
 		}
 	}
+	if v, ok := cfg["readOnly"]; ok {
+		if vv, ok := parseBool(v); ok {
+			out.ReadOnly = vv
+		}
+	}
+	if v, ok := cfg["readonly"]; ok {
+		if vv, ok := parseBool(v); ok {
+			out.ReadOnly = vv
+		}
+	}
+	if v, ok := cfg["watcher"].(Map); ok {
+		out.Watcher = v
+	}
+	if v, ok := parseIntAny(cfg["maxOpen"]); ok {
+		out.MaxOpen = v
+	}
+	if v, ok := parseIntAny(cfg["max_open"]); ok {
+		out.MaxOpen = v
+	}
+	if v, ok := parseIntAny(cfg["maxIdle"]); ok {
+		out.MaxIdle = v
+	}
+	if v, ok := parseIntAny(cfg["max_idle"]); ok {
+		out.MaxIdle = v
+	}
+	if v, ok := parseDurationAny(cfg["maxLifetime"]); ok {
+		out.MaxLifetime = v
+	}
+	if v, ok := parseDurationAny(cfg["max_lifetime"]); ok {
+		out.MaxLifetime = v
+	}
+	if v, ok := parseDurationAny(cfg["maxIdleTime"]); ok {
+		out.MaxIdleTime = v
+	}
+	if v, ok := parseDurationAny(cfg["max_idle_time"]); ok {
+		out.MaxIdleTime = v
+	}
+	if pool, ok := cfg["pool"].(Map); ok {
+		if v, ok := parseIntAny(pool["maxOpen"]); ok {
+			out.MaxOpen = v
+		}
+		if v, ok := parseIntAny(pool["max_open"]); ok {
+			out.MaxOpen = v
+		}
+		if v, ok := parseIntAny(pool["maxIdle"]); ok {
+			out.MaxIdle = v
+		}
+		if v, ok := parseIntAny(pool["max_idle"]); ok {
+			out.MaxIdle = v
+		}
+		if v, ok := parseDurationAny(pool["maxLifetime"]); ok {
+			out.MaxLifetime = v
+		}
+		if v, ok := parseDurationAny(pool["max_lifetime"]); ok {
+			out.MaxLifetime = v
+		}
+		if v, ok := parseDurationAny(pool["maxIdleTime"]); ok {
+			out.MaxIdleTime = v
+		}
+		if v, ok := parseDurationAny(pool["max_idle_time"]); ok {
+			out.MaxIdleTime = v
+		}
+	}
 	if v, ok := cfg["migrate"].(Map); ok {
 		if vv, ok := v["mode"].(string); ok {
 			out.Migrate.Mode = strings.ToLower(strings.TrimSpace(vv))
@@ -259,7 +348,7 @@ func (m *Module) configure(name string, cfg Map) {
 
 func isDataReservedMapKey(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "setting", "migrate":
+	case "setting", "migrate", "watcher":
 		return true
 	default:
 		return false
@@ -289,6 +378,28 @@ func parseDurationAny(v Any) (time.Duration, bool) {
 			return 0, false
 		}
 		return time.Duration(vv) * time.Millisecond, true
+	default:
+		return 0, false
+	}
+}
+
+func parseIntAny(v Any) (int, bool) {
+	switch vv := v.(type) {
+	case int:
+		if vv < 0 {
+			return 0, false
+		}
+		return vv, true
+	case int64:
+		if vv < 0 {
+			return 0, false
+		}
+		return int(vv), true
+	case float64:
+		if vv < 0 {
+			return 0, false
+		}
+		return int(vv), true
 	default:
 		return 0, false
 	}
@@ -351,8 +462,23 @@ func (m *Module) Open() {
 		if err := conn.Open(); err != nil {
 			panic("failed to open data: " + err.Error())
 		}
+		if db := conn.DB(); db != nil {
+			if cfg.MaxOpen > 0 {
+				db.SetMaxOpenConns(cfg.MaxOpen)
+			}
+			if cfg.MaxIdle > 0 {
+				db.SetMaxIdleConns(cfg.MaxIdle)
+			}
+			if cfg.MaxLifetime > 0 {
+				db.SetConnMaxLifetime(cfg.MaxLifetime)
+			}
+			if cfg.MaxIdleTime > 0 {
+				db.SetConnMaxIdleTime(cfg.MaxIdleTime)
+			}
+		}
 		inst.conn = conn
 		m.instances[name] = inst
+		m.dispatchers[name] = newChangeDispatcher(name, m.parseChangeConfig(cfg), m)
 	}
 
 	m.connected = true
@@ -365,6 +491,7 @@ func (m *Module) Start() {
 		return
 	}
 	m.started = true
+	fmt.Printf("bamgoo data module is running with %d connections.\n", len(m.instances))
 }
 
 func (m *Module) Stop() {
@@ -384,7 +511,11 @@ func (m *Module) Close() {
 			_ = inst.conn.Close()
 		}
 	}
+	for _, dispatcher := range m.dispatchers {
+		dispatcher.close()
+	}
 	m.instances = make(map[string]*Instance, 0)
+	m.dispatchers = make(map[string]*changeDispatcher, 0)
 	m.connected = false
 	m.initialized = false
 }
@@ -397,4 +528,51 @@ func (m *Module) GetCapabilities(names ...string) (Capabilities, error) {
 		return Capabilities{}, errInvalidConnection
 	}
 	return caps, nil
+}
+
+func (m *Module) PoolStats(names ...string) []PoolStats {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	out := make([]PoolStats, 0, len(m.instances))
+	allow := map[string]struct{}{}
+	if len(names) > 0 {
+		for _, name := range names {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				allow[name] = struct{}{}
+			}
+		}
+	}
+
+	for name, inst := range m.instances {
+		if len(allow) > 0 {
+			if _, ok := allow[name]; !ok {
+				continue
+			}
+		}
+		ps := PoolStats{Name: name, Driver: inst.Config.Driver}
+		if db := inst.conn.DB(); db != nil {
+			stats := db.Stats()
+			ps.Open = stats.OpenConnections
+			ps.InUse = stats.InUse
+			ps.Idle = stats.Idle
+			ps.WaitCount = stats.WaitCount
+			ps.WaitDuration = stats.WaitDuration.Milliseconds()
+			ps.MaxOpen = stats.MaxOpenConnections
+		}
+		ss := m.Stats(name)
+		ps.Queries = ss.Queries
+		ps.Writes = ss.Writes
+		ps.Errors = ss.Errors
+		ps.CacheHit = ss.CacheHit
+		ps.CacheRate = ss.CacheRate
+		ps.Slow = ss.Slow
+		ps.SlowAvgMs = ss.SlowAvgMs
+		ps.SlowP50Ms = ss.SlowP50Ms
+		ps.SlowP95Ms = ss.SlowP95Ms
+		out = append(out, ps)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }

@@ -140,7 +140,7 @@ _ = items
 
 ```go
 _ = db.Tx(func(tx data.DataBase) error {
-  _, err := tx.Table("user").CreateMany([]base.Map{
+  _, err := tx.Table("user").InsertMany([]base.Map{
     {"name": "A"},
     {"name": "B"},
   })

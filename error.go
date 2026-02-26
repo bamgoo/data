@@ -13,12 +13,16 @@ var (
 	ErrInvalidQuery  = errors.New("data: invalid query")
 	ErrInvalidUpdate = errors.New("data: invalid update")
 	ErrTxFailed      = errors.New("data: tx failed")
+	ErrValidation    = errors.New("data: validation")
+	ErrDriver        = errors.New("data: driver")
+	ErrTimeout       = errors.New("data: timeout")
 )
 
 type DataError struct {
 	Op   string
 	Code error
 	Err  error
+	Kind string
 }
 
 func (e *DataError) Error() string {
@@ -52,7 +56,11 @@ func wrapErr(op string, code error, err error) error {
 	if err == nil {
 		return nil
 	}
-	return &DataError{Op: op, Code: code, Err: err}
+	return &DataError{Op: op, Code: code, Err: err, Kind: classifyErrorKind(code, err)}
+}
+
+func Error(op string, code error, err error) error {
+	return wrapErr(op, code, err)
 }
 
 func classifySQLError(err error) error {
@@ -68,4 +76,44 @@ func classifySQLError(err error) error {
 	default:
 		return err
 	}
+}
+
+func classifyErrorKind(code error, err error) string {
+	if code == ErrInvalidQuery || code == ErrInvalidUpdate || code == ErrValidation {
+		return "validation"
+	}
+	if code == ErrTxFailed {
+		return "tx"
+	}
+	if code == ErrConflict {
+		return "conflict"
+	}
+	if code == ErrNotFound {
+		return "not_found"
+	}
+	msg := ""
+	if err != nil {
+		msg = strings.ToLower(err.Error())
+	}
+	switch {
+	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline"):
+		return "timeout"
+	case strings.Contains(msg, "connection"), strings.Contains(msg, "network"), strings.Contains(msg, "dial tcp"), strings.Contains(msg, "broken pipe"):
+		return "driver"
+	default:
+		return "unknown"
+	}
+}
+
+func ErrorKind(err error) string {
+	if err == nil {
+		return ""
+	}
+	if de, ok := err.(*DataError); ok {
+		if de.Kind != "" {
+			return de.Kind
+		}
+		return classifyErrorKind(de.Code, de.Err)
+	}
+	return classifyErrorKind(nil, err)
 }

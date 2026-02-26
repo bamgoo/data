@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bamgoo/bamgoo"
@@ -47,6 +48,7 @@ type (
 		Target string `json:"target"`
 		SQL    string `json:"sql,omitempty"`
 		Apply  bool   `json:"apply"`
+		Risk   string `json:"risk,omitempty"`
 		Detail string `json:"detail,omitempty"`
 	}
 
@@ -58,6 +60,8 @@ type (
 
 	DataBase interface {
 		Close() error
+		WithContext(context.Context) DataBase
+		WithTimeout(time.Duration) DataBase
 		Begin() error
 		Commit() error
 		Rollback() error
@@ -83,8 +87,8 @@ type (
 	}
 
 	DataTable interface {
-		Create(Map) Map
-		CreateMany([]Map) []Map
+		Insert(Map) Map
+		InsertMany([]Map) []Map
 		Upsert(Map, ...Any) Map
 		UpsertMany([]Map, ...Any) []Map
 		Change(Map, Map) Map
@@ -131,6 +135,9 @@ type sqlBase struct {
 	mutex  sync.RWMutex
 	err    error
 	mode   string
+	ctx    context.Context
+	tmo    time.Duration
+	mute   atomic.Int32
 }
 
 type invalidDataBase struct {
@@ -171,6 +178,23 @@ func (b *sqlBase) Close() error {
 	return nil
 }
 
+func (b *sqlBase) WithContext(ctx context.Context) DataBase {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.mutex.Lock()
+	b.ctx = ctx
+	b.mutex.Unlock()
+	return b
+}
+
+func (b *sqlBase) WithTimeout(timeout time.Duration) DataBase {
+	b.mutex.Lock()
+	b.tmo = timeout
+	b.mutex.Unlock()
+	return b
+}
+
 func (b *sqlBase) Error() error {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
@@ -196,11 +220,48 @@ func (b *sqlBase) setError(err error) {
 	b.err = err
 }
 
+func (b *sqlBase) opContext(defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	b.mutex.RLock()
+	base := b.ctx
+	timeout := b.tmo
+	b.mutex.RUnlock()
+
+	if base == nil {
+		base = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	if timeout > 0 {
+		return context.WithTimeout(base, timeout)
+	}
+	return base, func() {}
+}
+
+func (b *sqlBase) suppressChange() func() {
+	b.mute.Add(1)
+	return func() {
+		b.mute.Add(-1)
+	}
+}
+
+func (b *sqlBase) emitChange(op, table string, rows int64, key Any, data Map, where Map) {
+	if b == nil || b.inst == nil {
+		return
+	}
+	if b.mute.Load() > 0 {
+		return
+	}
+	EmitMutation(b.inst.Name, table, op, rows, key, data, where)
+}
+
 func (b *sqlBase) Begin() error {
 	if b.tx != nil {
 		return nil
 	}
-	tx, err := b.conn.DB().BeginTx(context.Background(), nil)
+	ctx, cancel := b.opContext(10 * time.Second)
+	defer cancel()
+	tx, err := b.conn.DB().BeginTx(ctx, nil)
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
 		return wrapErr("tx.begin", ErrTxFailed, classifySQLError(err))
@@ -258,6 +319,10 @@ func (b *sqlBase) Capabilities() Capabilities {
 }
 
 func (b *sqlBase) Migrate(names ...string) {
+	if err := b.ensureWritable("migrate"); err != nil {
+		b.setError(err)
+		return
+	}
 	_, _ = b.migrateWith(names, MigrateOptions{})
 }
 
@@ -272,21 +337,37 @@ func (b *sqlBase) MigrateDiff(names ...string) MigrateReport {
 }
 
 func (b *sqlBase) MigrateUp(versions ...string) {
+	if err := b.ensureWritable("migrate.up"); err != nil {
+		b.setError(err)
+		return
+	}
 	err := b.runVersionedUp(versions...)
 	b.setError(err)
 }
 
 func (b *sqlBase) MigrateDown(steps int) {
+	if err := b.ensureWritable("migrate.down"); err != nil {
+		b.setError(err)
+		return
+	}
 	err := b.runVersionedDown(steps)
 	b.setError(err)
 }
 
 func (b *sqlBase) MigrateTo(version string) {
+	if err := b.ensureWritable("migrate.to"); err != nil {
+		b.setError(err)
+		return
+	}
 	err := b.runVersionedTo(version)
 	b.setError(err)
 }
 
 func (b *sqlBase) MigrateDownTo(version string) {
+	if err := b.ensureWritable("migrate.downTo"); err != nil {
+		b.setError(err)
+		return
+	}
 	err := b.runVersionedDownTo(version)
 	b.setError(err)
 }
@@ -479,7 +560,7 @@ func (b *sqlBase) planTableActions(schema, table, key string, fields Vars, index
 		if err != nil {
 			return nil, err
 		}
-		actions = append(actions, MigrateAction{Kind: "create_table", Target: table, SQL: sqlText, Apply: !opts.DryRun})
+		actions = append(actions, MigrateAction{Kind: "create_table", Target: table, SQL: sqlText, Apply: !opts.DryRun, Risk: migrateActionRisk("create_table")})
 	}
 
 	currentCols := map[string]struct{}{}
@@ -516,7 +597,7 @@ func (b *sqlBase) planTableActions(schema, table, key string, fields Vars, index
 			continue
 		}
 		sqlText := b.buildAddColumnSQL(schema, table, name, desiredCols[name], applyNotNull)
-		actions = append(actions, MigrateAction{Kind: "add_column", Target: table + "." + name, SQL: sqlText, Apply: !opts.DryRun})
+		actions = append(actions, MigrateAction{Kind: "add_column", Target: table + "." + name, SQL: sqlText, Apply: !opts.DryRun, Risk: migrateActionRisk("add_column")})
 	}
 
 	desiredIndexes := b.collectIndexes(table, indexes, setting)
@@ -529,7 +610,7 @@ func (b *sqlBase) planTableActions(schema, table, key string, fields Vars, index
 			continue
 		}
 		sqlText := b.buildCreateIndexSQL(schema, table, idx, opts.Concurrent)
-		actions = append(actions, MigrateAction{Kind: "create_index", Target: idx.Name, SQL: sqlText, Apply: !opts.DryRun})
+		actions = append(actions, MigrateAction{Kind: "create_index", Target: idx.Name, SQL: sqlText, Apply: !opts.DryRun, Risk: migrateActionRisk("create_index")})
 	}
 
 	if opts.Mode == "strict" || opts.Mode == "danger" {
@@ -546,7 +627,7 @@ func (b *sqlBase) planTableActions(schema, table, key string, fields Vars, index
 			if opts.Mode == "strict" {
 				detail = "strict mode reports drift only; use danger mode to apply destructive changes"
 			}
-			actions = append(actions, MigrateAction{Kind: "drop_column", Target: table + "." + col, SQL: sqlText, Apply: apply, Detail: detail})
+			actions = append(actions, MigrateAction{Kind: "drop_column", Target: table + "." + col, SQL: sqlText, Apply: apply, Risk: migrateActionRisk("drop_column"), Detail: detail})
 		}
 		keep := make(map[string]struct{}, len(desiredIndexes))
 		for _, idx := range desiredIndexes {
@@ -565,7 +646,7 @@ func (b *sqlBase) planTableActions(schema, table, key string, fields Vars, index
 			if opts.Mode == "strict" {
 				detail = "strict mode reports drift only; use danger mode to apply destructive changes"
 			}
-			actions = append(actions, MigrateAction{Kind: "drop_index", Target: idx, SQL: sqlText, Apply: apply, Detail: detail})
+			actions = append(actions, MigrateAction{Kind: "drop_index", Target: idx, SQL: sqlText, Apply: apply, Risk: migrateActionRisk("drop_index"), Detail: detail})
 		}
 	}
 
@@ -593,6 +674,17 @@ func (b *sqlBase) executeMigrateActions(actions []MigrateAction, opts MigrateOpt
 		}
 	}
 	return nil
+}
+
+func migrateActionRisk(kind string) string {
+	switch kind {
+	case "drop_column":
+		return "high"
+	case "drop_index":
+		return "medium"
+	default:
+		return "low"
+	}
 }
 
 func (b *sqlBase) migrateRetry(opts MigrateOptions, tag string, run func() error) error {
@@ -1110,7 +1202,9 @@ type execer interface {
 
 func (b *sqlBase) Raw(query string, args ...Any) []Map {
 	start := time.Now()
-	rows, err := b.currentExec().QueryContext(context.Background(), query, toInterfaces(args)...)
+	ctx, cancel := b.opContext(30 * time.Second)
+	defer cancel()
+	rows, err := b.currentExec().QueryContext(ctx, query, toInterfaces(args)...)
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
 		b.setError(wrapErr("raw.query", ErrInvalidQuery, classifySQLError(err)))
@@ -1130,8 +1224,16 @@ func (b *sqlBase) Raw(query string, args ...Any) []Map {
 }
 
 func (b *sqlBase) Exec(query string, args ...Any) int64 {
+	if isWriteSQL(query) {
+		if err := b.ensureWritable("exec"); err != nil {
+			b.setError(err)
+			return 0
+		}
+	}
 	start := time.Now()
-	res, err := b.currentExec().ExecContext(context.Background(), query, toInterfaces(args)...)
+	ctx, cancel := b.opContext(30 * time.Second)
+	defer cancel()
+	res, err := b.currentExec().ExecContext(ctx, query, toInterfaces(args)...)
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
 		b.setError(wrapErr("exec", ErrInvalidQuery, classifySQLError(err)))
@@ -1139,7 +1241,11 @@ func (b *sqlBase) Exec(query string, args ...Any) int64 {
 	}
 	b.logSlow(query, args, start)
 	statsFor(b.inst.Name).Writes.Add(1)
-	cacheVersionBump(b.inst.Name)
+	if table, ok := parseWriteSQLTable(query); ok {
+		cacheTouchTable(b.inst.Name, table)
+	} else {
+		cacheVersionBump(b.inst.Name)
+	}
 	affected, err := res.RowsAffected()
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
@@ -1464,6 +1570,7 @@ func (b *sqlBase) logSlow(query string, args []Any, start time.Time) {
 		return
 	}
 	statsFor(b.inst.Name).Slow.Add(1)
+	observeSlowCost(b.inst.Name, cost)
 	fmt.Printf("[data][slow] conn=%s dialect=%s cost=%s sql=%s args=%v\n", b.inst.Name, b.conn.Dialect().Name(), cost.String(), query, args)
 }
 
@@ -1685,6 +1792,19 @@ func (b *sqlBase) runVersionedDownTo(target string) error {
 	if target == "" {
 		return fmt.Errorf("empty migrate down target version")
 	}
+	all := Migrations(b.inst.Name)
+	indexes := map[string]int{}
+	targetIdx := -1
+	for i, mg := range all {
+		v := strings.TrimSpace(mg.Version)
+		indexes[v] = i
+		if v == target {
+			targetIdx = i
+		}
+	}
+	if targetIdx < 0 {
+		return fmt.Errorf("migration target version not found: %s", target)
+	}
 	if err := b.ensureVersionMigrateTable(); err != nil {
 		return err
 	}
@@ -1694,7 +1814,11 @@ func (b *sqlBase) runVersionedDownTo(target string) error {
 	}
 	steps := 0
 	for _, v := range applied {
-		if v > target {
+		idx, ok := indexes[v]
+		if !ok {
+			return fmt.Errorf("migration version not registered: %s", v)
+		}
+		if idx > targetIdx {
 			steps++
 		}
 	}
@@ -1789,6 +1913,113 @@ func (b *sqlBase) ensureMigrationLogTable() error {
 	return err
 }
 
+func (b *sqlBase) ensureWritable(op string) error {
+	if b == nil || b.inst == nil {
+		return nil
+	}
+	if b.inst.Config.ReadOnly || isReadOnlySetting(b.inst.Config.Setting) {
+		return wrapErr(op, ErrValidation, fmt.Errorf("readonly data connection: %s", b.inst.Name))
+	}
+	return nil
+}
+
+func isReadOnlySetting(setting Map) bool {
+	if setting == nil {
+		return false
+	}
+	for _, key := range []string{"readOnly", "readonly"} {
+		if raw, ok := setting[key]; ok {
+			if vv, ok := parseBool(raw); ok && vv {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b *sqlBase) scanBatchSize() int64 {
+	if b == nil || b.inst == nil {
+		return 0
+	}
+	if b.inst.Config.Setting == nil {
+		return 0
+	}
+	for _, key := range []string{"scanBatch", "scan_batch"} {
+		if raw, ok := b.inst.Config.Setting[key]; ok {
+			if vv, ok := parseInt64(raw); ok && vv > 0 {
+				return vv
+			}
+		}
+	}
+	return 0
+}
+
+func isWriteSQL(query string) bool {
+	s := strings.ToLower(strings.TrimSpace(query))
+	switch {
+	case strings.HasPrefix(s, "insert "),
+		strings.HasPrefix(s, "update "),
+		strings.HasPrefix(s, "delete "),
+		strings.HasPrefix(s, "replace "),
+		strings.HasPrefix(s, "merge "),
+		strings.HasPrefix(s, "create "),
+		strings.HasPrefix(s, "alter "),
+		strings.HasPrefix(s, "drop "),
+		strings.HasPrefix(s, "truncate "),
+		strings.HasPrefix(s, "grant "),
+		strings.HasPrefix(s, "revoke "):
+		return true
+	default:
+		return false
+	}
+}
+
+func parseWriteSQLTable(query string) (string, bool) {
+	parts := strings.Fields(strings.ToLower(strings.TrimSpace(query)))
+	if len(parts) < 2 {
+		return "", false
+	}
+	switch parts[0] {
+	case "insert", "replace":
+		// insert into table ...
+		if len(parts) >= 3 && parts[1] == "into" {
+			return normalizeSQLTableToken(parts[2]), true
+		}
+	case "update":
+		return normalizeSQLTableToken(parts[1]), true
+	case "delete":
+		// delete from table ...
+		if len(parts) >= 3 && parts[1] == "from" {
+			return normalizeSQLTableToken(parts[2]), true
+		}
+	case "truncate":
+		// truncate table table ...
+		if len(parts) >= 3 && parts[1] == "table" {
+			return normalizeSQLTableToken(parts[2]), true
+		}
+	case "alter", "drop", "create":
+		// alter table table ...
+		if len(parts) >= 3 && parts[1] == "table" {
+			return normalizeSQLTableToken(parts[2]), true
+		}
+	}
+	return "", false
+}
+
+func normalizeSQLTableToken(token string) string {
+	token = strings.TrimSpace(token)
+	token = strings.Trim(token, "`\"' ")
+	if idx := strings.Index(token, "("); idx >= 0 {
+		token = token[:idx]
+	}
+	if strings.Contains(token, ".") {
+		ps := strings.Split(token, ".")
+		token = ps[len(ps)-1]
+		token = strings.Trim(token, "`\"' ")
+	}
+	return token
+}
+
 func (b *sqlBase) logMigrationEvent(kind, version, name string, success bool, cost time.Duration, err error) {
 	if b.ensureMigrationLogTable() != nil {
 		return
@@ -1829,12 +2060,16 @@ func migrationNodeID() string {
 	return fmt.Sprintf("%s:%d", host, os.Getpid())
 }
 
-func (b *invalidDataBase) Close() error      { return nil }
-func (b *invalidDataBase) Begin() error      { return b.err }
-func (b *invalidDataBase) Commit() error     { return b.err }
-func (b *invalidDataBase) Rollback() error   { return b.err }
-func (b *invalidDataBase) Tx(TxFunc) error   { return b.err }
-func (b *invalidDataBase) Migrate(...string) {}
+func (b *invalidDataBase) Close() error { return nil }
+func (b *invalidDataBase) WithContext(context.Context) DataBase {
+	return b
+}
+func (b *invalidDataBase) WithTimeout(time.Duration) DataBase { return b }
+func (b *invalidDataBase) Begin() error                       { return b.err }
+func (b *invalidDataBase) Commit() error                      { return b.err }
+func (b *invalidDataBase) Rollback() error                    { return b.err }
+func (b *invalidDataBase) Tx(TxFunc) error                    { return b.err }
+func (b *invalidDataBase) Migrate(...string)                  {}
 func (b *invalidDataBase) MigratePlan(...string) MigrateReport {
 	return MigrateReport{}
 }
@@ -1857,8 +2092,8 @@ func (b *invalidDataBase) Parse(...Any) (string, []Any) {
 	return "", nil
 }
 
-func (t *invalidTable) Create(Map) Map                 { return nil }
-func (t *invalidTable) CreateMany([]Map) []Map         { return nil }
+func (t *invalidTable) Insert(Map) Map                 { return nil }
+func (t *invalidTable) InsertMany([]Map) []Map         { return nil }
 func (t *invalidTable) Upsert(Map, ...Any) Map         { return nil }
 func (t *invalidTable) UpsertMany([]Map, ...Any) []Map { return nil }
 func (t *invalidTable) Change(Map, Map) Map            { return nil }

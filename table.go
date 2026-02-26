@@ -14,15 +14,19 @@ type sqlTable struct {
 	sqlView
 }
 
-func (t *sqlTable) Create(data Map) Map {
+func (t *sqlTable) Insert(data Map) Map {
+	if err := t.base.ensureWritable(t.name + ".insert"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	val, err := mapCreate(t.fields, data)
 	if err != nil {
-		t.base.setError(wrapErr(t.name+".create.map", ErrInvalidUpdate, err))
+		t.base.setError(wrapErr(t.name+".insert.map", ErrInvalidUpdate, err))
 		return nil
 	}
 	val = t.normalizeWriteMap(val)
 	if len(val) == 0 {
-		t.base.setError(wrapErr(t.name+".create.empty", ErrInvalidUpdate, fmt.Errorf("empty create data")))
+		t.base.setError(wrapErr(t.name+".insert.empty", ErrInvalidUpdate, fmt.Errorf("empty insert data")))
 		return nil
 	}
 
@@ -47,7 +51,7 @@ func (t *sqlTable) Create(data Map) Map {
 		var id any
 		if err := t.base.currentExec().QueryRowContext(context.Background(), sqlText, toInterfaces(vals)...).Scan(&id); err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
-			t.base.setError(wrapErr(t.name+".create.return", ErrInvalidUpdate, classifySQLError(err)))
+			t.base.setError(wrapErr(t.name+".insert.return", ErrInvalidUpdate, classifySQLError(err)))
 			return nil
 		}
 		val[t.key] = id
@@ -55,7 +59,7 @@ func (t *sqlTable) Create(data Map) Map {
 		res, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(vals)...)
 		if err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
-			t.base.setError(wrapErr(t.name+".create.exec", ErrInvalidUpdate, classifySQLError(err)))
+			t.base.setError(wrapErr(t.name+".insert.exec", ErrInvalidUpdate, classifySQLError(err)))
 			return nil
 		}
 		if id, err := res.LastInsertId(); err == nil {
@@ -64,17 +68,22 @@ func (t *sqlTable) Create(data Map) Map {
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
 	cacheTouchTable(t.base.inst.Name, t.source)
+	t.base.emitChange(MutationInsert, t.source, 1, val[t.key], val, nil)
 
 	t.base.setError(nil)
 	return val
 }
 
-func (t *sqlTable) CreateMany(items []Map) []Map {
+func (t *sqlTable) InsertMany(items []Map) []Map {
+	if err := t.base.ensureWritable(t.name + ".insertMany"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	if len(items) == 0 {
 		t.base.setError(nil)
 		return []Map{}
 	}
-	if out, ok, err := t.createManyBatch(items); ok {
+	if out, ok, err := t.insertManyBatch(items); ok {
 		t.base.setError(err)
 		return out
 	}
@@ -82,29 +91,29 @@ func (t *sqlTable) CreateMany(items []Map) []Map {
 	err := t.base.Tx(func(db DataBase) error {
 		tb := db.Table(t.name)
 		for _, item := range items {
-			one := tb.Create(item)
+			one := tb.Insert(item)
 			if db.Error() != nil {
-				return wrapErr(t.name+".createMany.item", ErrInvalidUpdate, db.Error())
+				return wrapErr(t.name+".insertMany.item", ErrInvalidUpdate, db.Error())
 			}
 			out = append(out, one)
 		}
 		return nil
 	})
-	t.base.setError(wrapErr(t.name+".createMany", ErrInvalidUpdate, err))
+	t.base.setError(wrapErr(t.name+".insertMany", ErrInvalidUpdate, err))
 	return out
 }
 
-func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
+func (t *sqlTable) insertManyBatch(items []Map) ([]Map, bool, error) {
 	normalized := make([]Map, 0, len(items))
 	keySet := make(map[string]struct{}, 8)
 	for _, item := range items {
 		val, err := mapCreate(t.fields, item)
 		if err != nil {
-			return nil, true, wrapErr(t.name+".createMany.map", ErrInvalidUpdate, err)
+			return nil, true, wrapErr(t.name+".insertMany.map", ErrInvalidUpdate, err)
 		}
 		val = t.normalizeWriteMap(val)
 		if len(val) == 0 {
-			return nil, true, wrapErr(t.name+".createMany.empty", ErrInvalidUpdate, fmt.Errorf("empty create data"))
+			return nil, true, wrapErr(t.name+".insertMany.empty", ErrInvalidUpdate, fmt.Errorf("empty insert data"))
 		}
 		normalized = append(normalized, val)
 		for k, v := range val {
@@ -115,7 +124,7 @@ func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
 		}
 	}
 	if len(keySet) == 0 {
-		return nil, true, wrapErr(t.name+".createMany.cols", ErrInvalidUpdate, fmt.Errorf("no insert columns"))
+		return nil, true, wrapErr(t.name+".insertMany.cols", ErrInvalidUpdate, fmt.Errorf("no insert columns"))
 	}
 	cols := make([]string, 0, len(keySet))
 	for k := range keySet {
@@ -145,7 +154,7 @@ func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
 		rows, err := t.base.currentExec().QueryContext(context.Background(), sqlText, toInterfaces(args)...)
 		if err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
-			return nil, true, wrapErr(t.name+".createMany.returning", ErrInvalidUpdate, classifySQLError(err))
+			return nil, true, wrapErr(t.name+".insertMany.returning", ErrInvalidUpdate, classifySQLError(err))
 		}
 		defer rows.Close()
 		i := 0
@@ -153,7 +162,7 @@ func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
 			var id any
 			if err := rows.Scan(&id); err != nil {
 				statsFor(t.base.inst.Name).Errors.Add(1)
-				return nil, true, wrapErr(t.name+".createMany.scan", ErrInvalidUpdate, classifySQLError(err))
+				return nil, true, wrapErr(t.name+".insertMany.scan", ErrInvalidUpdate, classifySQLError(err))
 			}
 			if i < len(normalized) {
 				normalized[i][t.key] = id
@@ -162,7 +171,7 @@ func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
 		}
 		if err := rows.Err(); err != nil {
 			statsFor(t.base.inst.Name).Errors.Add(1)
-			return nil, true, wrapErr(t.name+".createMany.rows", ErrInvalidUpdate, classifySQLError(err))
+			return nil, true, wrapErr(t.name+".insertMany.rows", ErrInvalidUpdate, classifySQLError(err))
 		}
 	} else {
 		if _, err := t.base.currentExec().ExecContext(context.Background(), sqlText, toInterfaces(args)...); err != nil {
@@ -173,10 +182,15 @@ func (t *sqlTable) createManyBatch(items []Map) ([]Map, bool, error) {
 	}
 	statsFor(t.base.inst.Name).Writes.Add(int64(len(normalized)))
 	cacheTouchTable(t.base.inst.Name, t.source)
+	t.base.emitChange(MutationInsert, t.source, int64(len(normalized)), nil, nil, nil)
 	return normalized, true, nil
 }
 
 func (t *sqlTable) Upsert(data Map, args ...Any) Map {
+	if err := t.base.ensureWritable(t.name + ".upsert"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	condition := Map{}
 	if len(args) > 0 {
 		if m, ok := args[0].(Map); ok {
@@ -191,12 +205,17 @@ func (t *sqlTable) Upsert(data Map, args ...Any) Map {
 		}
 	}
 	if len(condition) == 0 {
-		return t.Create(data)
+		out := t.Insert(data)
+		if t.base.Error() == nil && out != nil {
+			t.base.emitChange(MutationUpsert, t.source, 1, out[t.key], nil, condition)
+		}
+		return out
 	}
 
 	createData := t.upsertCreateData(data, condition)
 	if item, err := t.upsertNative(createData, condition); err == nil && item != nil {
 		t.base.setError(nil)
+		t.base.emitChange(MutationUpsert, t.source, 1, item[t.key], nil, condition)
 		return item
 	}
 
@@ -206,12 +225,24 @@ func (t *sqlTable) Upsert(data Map, args ...Any) Map {
 		return nil
 	}
 	if item == nil {
-		return t.Create(createData)
+		out := t.Insert(createData)
+		if t.base.Error() == nil && out != nil {
+			t.base.emitChange(MutationUpsert, t.source, 1, out[t.key], nil, condition)
+		}
+		return out
 	}
-	return t.Change(item, data)
+	out := t.Change(item, data)
+	if t.base.Error() == nil && out != nil {
+		t.base.emitChange(MutationUpsert, t.source, 1, out[t.key], nil, condition)
+	}
+	return out
 }
 
 func (t *sqlTable) UpsertMany(items []Map, args ...Any) []Map {
+	if err := t.base.ensureWritable(t.name + ".upsertMany"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	if len(items) == 0 {
 		t.base.setError(nil)
 		return []Map{}
@@ -233,6 +264,10 @@ func (t *sqlTable) UpsertMany(items []Map, args ...Any) []Map {
 }
 
 func (t *sqlTable) Change(item Map, data Map) Map {
+	if err := t.base.ensureWritable(t.name + ".change"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	if item == nil || item[t.key] == nil {
 		t.base.setError(wrapErr(t.name+".change.key", ErrInvalidUpdate, fmt.Errorf("missing primary key %s", t.key)))
 		return nil
@@ -268,11 +303,16 @@ func (t *sqlTable) Change(item Map, data Map) Map {
 	for k, v := range setMap {
 		out[k] = v
 	}
+	t.base.emitChange(MutationUpdate, t.source, 1, item[t.key], setMap, Map{t.key: item[t.key]})
 	t.base.setError(nil)
 	return out
 }
 
 func (t *sqlTable) Remove(args ...Any) Map {
+	if err := t.base.ensureWritable(t.name + ".remove"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	item := t.First(args...)
 	if t.base.Error() != nil || item == nil {
 		if t.base.Error() != nil {
@@ -291,11 +331,16 @@ func (t *sqlTable) Remove(args ...Any) Map {
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
 	cacheTouchTable(t.base.inst.Name, t.source)
+	t.base.emitChange(MutationDelete, t.source, 1, item[t.key], nil, Map{t.key: item[t.key]})
 	t.base.setError(nil)
 	return item
 }
 
 func (t *sqlTable) Update(sets Map, args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".update"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
 	q, err := ParseQuery(args...)
 	if err != nil {
 		t.base.setError(wrapErr(t.name+".update.parse", ErrInvalidQuery, err))
@@ -349,11 +394,16 @@ func (t *sqlTable) Update(sets Map, args ...Any) int64 {
 		t.base.setError(wrapErr(t.name+".update.rows", ErrInvalidQuery, classifySQLError(err)))
 		return 0
 	}
+	t.base.emitChange(MutationUpdate, t.source, affected, nil, sets, nil)
 	t.base.setError(nil)
 	return affected
 }
 
 func (t *sqlTable) Delete(args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".delete"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
 	q, err := ParseQuery(args...)
 	if err != nil {
 		t.base.setError(wrapErr(t.name+".delete.parse", ErrInvalidQuery, err))
@@ -386,6 +436,7 @@ func (t *sqlTable) Delete(args ...Any) int64 {
 		t.base.setError(wrapErr(t.name+".delete.rows", ErrInvalidQuery, classifySQLError(err)))
 		return 0
 	}
+	t.base.emitChange(MutationDelete, t.source, affected, nil, nil, nil)
 	t.base.setError(nil)
 	return affected
 }
