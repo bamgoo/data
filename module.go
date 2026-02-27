@@ -2,6 +2,7 @@ package data
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -311,6 +312,12 @@ func (m *Module) configure(name string, cfg Map) {
 		}
 	}
 	if v, ok := cfg["migrate"].(Map); ok {
+		if vv, ok := v["startup"].(string); ok {
+			out.Migrate.Startup = strings.ToLower(strings.TrimSpace(vv))
+		}
+		if vv, ok := v["start"].(string); ok {
+			out.Migrate.Startup = strings.ToLower(strings.TrimSpace(vv))
+		}
 		if vv, ok := v["mode"].(string); ok {
 			out.Migrate.Mode = strings.ToLower(strings.TrimSpace(vv))
 		}
@@ -486,12 +493,72 @@ func (m *Module) Open() {
 
 func (m *Module) Start() {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
 	if m.started {
+		m.mutex.Unlock()
 		return
 	}
 	m.started = true
-	fmt.Printf("bamgoo data module is running with %d connections.\n", len(m.instances))
+	type startTarget struct {
+		name    string
+		startup string
+	}
+	targets := make([]startTarget, 0, len(m.instances))
+	for name, inst := range m.instances {
+		targets = append(targets, startTarget{
+			name:    name,
+			startup: normalizeMigrateStartup(inst.Config.Migrate.Startup),
+		})
+	}
+	m.mutex.Unlock()
+
+	for _, target := range targets {
+		db := m.Base(target.name)
+		if db == nil {
+			continue
+		}
+		func() {
+			defer db.Close()
+			switch resolveMigrateStartup(target.startup) {
+			case "off":
+				return
+			case "auto":
+				db.Migrate()
+				if err := db.Error(); err != nil {
+					panic(fmt.Sprintf("data migrate(auto) failed on %s: %v", target.name, err))
+				}
+				fmt.Printf("bamgoo data migrate(auto) done on %s.\n", target.name)
+			case "check":
+				report := db.MigrateDiff()
+				if err := db.Error(); err != nil {
+					panic(fmt.Sprintf("data migrate(check) failed on %s: %v", target.name, err))
+				}
+				if len(report.Actions) > 0 {
+					panic(fmt.Sprintf("data migrate(check) drift detected on %s: %d actions", target.name, len(report.Actions)))
+				}
+				fmt.Printf("bamgoo data migrate(check) passed on %s.\n", target.name)
+			}
+		}()
+	}
+
+	fmt.Printf("bamgoo data module is running with %d connections.\n", len(targets))
+}
+
+func resolveMigrateStartup(startup string) string {
+	mode := normalizeMigrateStartup(startup)
+	if mode != "role" {
+		return mode
+	}
+	role := strings.ToLower(strings.TrimSpace(os.Getenv("BAMGOO_ROLE")))
+	switch role {
+	case "migrator", "migration", "migrate", "schema", "schema-migrator":
+		return "auto"
+	case "app", "api", "worker", "web":
+		return "check"
+	case "off", "disabled":
+		return "off"
+	default:
+		return "off"
+	}
 }
 
 func (m *Module) Stop() {

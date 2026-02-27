@@ -89,6 +89,12 @@ func ParseQuery(args ...Any) (Query, error) {
 	if len(args) == 0 {
 		return q, nil
 	}
+	cacheKey := queryCompileKey(args)
+	if cacheKey != "" {
+		if cached, ok := loadQueryCompile(cacheKey); ok {
+			return cached, nil
+		}
+	}
 
 	if raw, ok := args[0].(string); ok && strings.TrimSpace(raw) != "" {
 		q.RawWhere = raw
@@ -97,6 +103,9 @@ func ParseQuery(args ...Any) (Query, error) {
 			for _, arg := range args[1:] {
 				q.RawParams = append(q.RawParams, arg)
 			}
+		}
+		if cacheKey != "" {
+			storeQueryCompile(cacheKey, q)
 		}
 		return q, nil
 	}
@@ -130,6 +139,9 @@ func ParseQuery(args ...Any) (Query, error) {
 		q.Filter = orRoots[0]
 	default:
 		q.Filter = OrExpr{Items: orRoots}
+	}
+	if cacheKey != "" {
+		storeQueryCompile(cacheKey, q)
 	}
 
 	return q, nil

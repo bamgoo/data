@@ -68,10 +68,11 @@ func (t *sqlTable) Insert(data Map) Map {
 	}
 	statsFor(t.base.inst.Name).Writes.Add(1)
 	cacheTouchTable(t.base.inst.Name, t.source)
-	t.base.emitChange(MutationInsert, t.source, 1, val[t.key], val, nil)
+	out := t.reloadEntityByKey(val[t.key], val)
+	t.base.emitChange(MutationInsert, t.source, 1, out[t.key], out, nil)
 
 	t.base.setError(nil)
-	return val
+	return out
 }
 
 func (t *sqlTable) InsertMany(items []Map) []Map {
@@ -214,6 +215,7 @@ func (t *sqlTable) Upsert(data Map, args ...Any) Map {
 
 	createData := t.upsertCreateData(data, condition)
 	if item, err := t.upsertNative(createData, condition); err == nil && item != nil {
+		item = t.reloadEntityByKey(item[t.key], item)
 		t.base.setError(nil)
 		t.base.emitChange(MutationUpsert, t.source, 1, item[t.key], nil, condition)
 		return item
@@ -303,9 +305,22 @@ func (t *sqlTable) Change(item Map, data Map) Map {
 	for k, v := range setMap {
 		out[k] = v
 	}
+	out = t.reloadEntityByKey(item[t.key], out)
 	t.base.emitChange(MutationUpdate, t.source, 1, item[t.key], setMap, Map{t.key: item[t.key]})
 	t.base.setError(nil)
 	return out
+}
+
+func (t *sqlTable) reloadEntityByKey(id Any, fallback Map) Map {
+	if id == nil {
+		return fallback
+	}
+	entity := t.Entity(id)
+	if t.base.Error() != nil || entity == nil {
+		t.base.setError(nil)
+		return fallback
+	}
+	return entity
 }
 
 func (t *sqlTable) Remove(args ...Any) Map {

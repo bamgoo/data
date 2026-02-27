@@ -319,6 +319,7 @@ func (v *sqlView) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 	}
 	q.Offset = offset
 	q.Limit = limit
+	q = v.ensureSliceSort(q)
 	total := v.Count(args...)
 	if v.base.Error() != nil {
 		v.base.setError(wrapErr(v.name+".limit.count", ErrInvalidQuery, v.base.Error()))
@@ -330,6 +331,18 @@ func (v *sqlView) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 		return 0, nil
 	}
 	return total, items
+}
+
+func (v *sqlView) ensureSliceSort(q Query) Query {
+	if len(q.Sort) > 0 {
+		return q
+	}
+	key := strings.TrimSpace(v.key)
+	if key == "" {
+		return q
+	}
+	q.Sort = []Sort{{Field: key}}
+	return q
 }
 
 func withQuery(args []Any, q Query) []Any {

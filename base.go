@@ -26,6 +26,7 @@ type (
 	TxFunc   func(DataBase) error
 
 	MigrateOptions struct {
+		Startup     string
 		Mode        string
 		DryRun      bool
 		DiffOnly    bool
@@ -66,6 +67,7 @@ type (
 		Commit() error
 		Rollback() error
 		Tx(TxFunc) error
+		TxReadOnly(TxFunc) error
 		Migrate(...string)
 		MigratePlan(...string) MigrateReport
 		MigrateDiff(...string) MigrateReport
@@ -256,12 +258,20 @@ func (b *sqlBase) emitChange(op, table string, rows int64, key Any, data Map, wh
 }
 
 func (b *sqlBase) Begin() error {
+	return b.beginTx(false)
+}
+
+func (b *sqlBase) beginTx(readOnly bool) error {
 	if b.tx != nil {
 		return nil
 	}
 	ctx, cancel := b.opContext(10 * time.Second)
 	defer cancel()
-	tx, err := b.conn.DB().BeginTx(ctx, nil)
+	opts := &sql.TxOptions{}
+	if readOnly {
+		opts.ReadOnly = true
+	}
+	tx, err := b.conn.DB().BeginTx(ctx, opts)
 	if err != nil {
 		statsFor(b.inst.Name).Errors.Add(1)
 		return wrapErr("tx.begin", ErrTxFailed, classifySQLError(err))
@@ -300,7 +310,7 @@ func (b *sqlBase) Tx(fn TxFunc) error {
 	if fn == nil {
 		return nil
 	}
-	if err := b.Begin(); err != nil {
+	if err := b.beginTx(false); err != nil {
 		return wrapErr("tx.begin", ErrTxFailed, err)
 	}
 	if err := fn(b); err != nil {
@@ -310,6 +320,30 @@ func (b *sqlBase) Tx(fn TxFunc) error {
 	if err := b.Commit(); err != nil {
 		_ = b.Rollback()
 		return wrapErr("tx.commit", ErrTxFailed, err)
+	}
+	return nil
+}
+
+func (b *sqlBase) TxReadOnly(fn TxFunc) error {
+	if fn == nil {
+		return nil
+	}
+	if b.tx != nil {
+		if err := fn(b); err != nil {
+			return wrapErr("tx.readonly.run", ErrTxFailed, err)
+		}
+		return b.Error()
+	}
+	if err := b.beginTx(true); err != nil {
+		return wrapErr("tx.readonly.begin", ErrTxFailed, err)
+	}
+	if err := fn(b); err != nil {
+		_ = b.Rollback()
+		return wrapErr("tx.readonly.run", ErrTxFailed, err)
+	}
+	if err := b.Commit(); err != nil {
+		_ = b.Rollback()
+		return wrapErr("tx.readonly.commit", ErrTxFailed, err)
 	}
 	return nil
 }
@@ -495,6 +529,7 @@ func (b *sqlBase) migrateWith(names []string, override MigrateOptions) (MigrateR
 
 func (b *sqlBase) defaultMigrateOptions() MigrateOptions {
 	opts := MigrateOptions{
+		Startup:     "off",
 		Mode:        "safe",
 		DryRun:      false,
 		DiffOnly:    false,
@@ -506,8 +541,11 @@ func (b *sqlBase) defaultMigrateOptions() MigrateOptions {
 		Jitter:      250 * time.Millisecond,
 	}
 	if b != nil && b.inst != nil {
+		if b.inst.Config.Migrate.Startup != "" {
+			opts.Startup = normalizeMigrateStartup(b.inst.Config.Migrate.Startup)
+		}
 		if b.inst.Config.Migrate.Mode != "" {
-			opts.Mode = b.inst.Config.Migrate.Mode
+			opts.Mode = normalizeMigrateMode(b.inst.Config.Migrate.Mode)
 		}
 		if b.inst.Config.Migrate.DryRun {
 			opts.DryRun = true
@@ -545,6 +583,16 @@ func normalizeMigrateMode(mode string) string {
 		return m
 	default:
 		return "safe"
+	}
+}
+
+func normalizeMigrateStartup(mode string) string {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case "auto", "check", "off", "role":
+		return m
+	default:
+		return "off"
 	}
 }
 
@@ -2069,6 +2117,7 @@ func (b *invalidDataBase) Begin() error                       { return b.err }
 func (b *invalidDataBase) Commit() error                      { return b.err }
 func (b *invalidDataBase) Rollback() error                    { return b.err }
 func (b *invalidDataBase) Tx(TxFunc) error                    { return b.err }
+func (b *invalidDataBase) TxReadOnly(TxFunc) error            { return b.err }
 func (b *invalidDataBase) Migrate(...string)                  {}
 func (b *invalidDataBase) MigratePlan(...string) MigrateReport {
 	return MigrateReport{}
