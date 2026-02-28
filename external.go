@@ -140,6 +140,34 @@ func Parse(args ...Any) (Query, error) {
 	return ParseQuery(args...)
 }
 
+func GetTable(name string) *Table {
+	return module.TableConfig(name)
+}
+
+func GetView(name string) *View {
+	return module.ViewConfig(name)
+}
+
+func GetModel(name string) *Model {
+	return module.ModelConfig(name)
+}
+
+func Field(name string, field string, extends ...Any) Var {
+	return module.Field(name, field, extends...)
+}
+
+func Fields(name string, keys []string, extends ...Vars) Vars {
+	return module.Fields(name, keys, extends...)
+}
+
+func Option(name string, field string, key string) Any {
+	return module.Option(name, field, key)
+}
+
+func Options(name string, field string) Map {
+	return module.Options(name, field)
+}
+
 func Tables() map[string]Table {
 	return module.Tables()
 }
