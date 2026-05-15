@@ -1285,7 +1285,7 @@ func (t *sqlTable) normalizeWriteValue(field string, value Any) Any {
 		}
 	}
 
-	if strings.HasPrefix(typeName, "array") || strings.HasPrefix(typeName, "[]") {
+	if isArrayWriteField(cfg, hasField) {
 		if dialect == "pgsql" || dialect == "postgres" {
 			return pgArrayLiteral(value)
 		}
@@ -1303,6 +1303,27 @@ func (t *sqlTable) normalizeWriteValue(field string, value Any) Any {
 	}
 
 	return value
+}
+
+func isArrayWriteField(cfg Var, hasField bool) bool {
+	if !hasField {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(cfg.Type))
+	if strings.HasPrefix(kind, "array") || strings.HasPrefix(kind, "[") {
+		return true
+	}
+	if cfg.Setting == nil {
+		return false
+	}
+	for _, key := range []string{"array", "multiple"} {
+		if raw, ok := cfg.Setting[key]; ok {
+			if on, yes := parseBool(raw); yes && on {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func collectionAppend(current Any, appendVal Any, unique bool) Any {
@@ -1413,6 +1434,7 @@ func (t *sqlTable) upsertNative(data Map, condition Map) (Map, error) {
 	if len(createVal) == 0 {
 		return nil, wrapErr(t.name+".upsert.native.empty", ErrInvalidUpdate, fmt.Errorf("empty upsert data"))
 	}
+	createVal = t.normalizeWriteMap(createVal)
 
 	keys := make([]string, 0, len(createVal))
 	for k := range createVal {
