@@ -9,6 +9,7 @@ import (
 	"time"
 
 	. "github.com/infrago/base"
+	"github.com/infrago/infra"
 )
 
 type sqlTable struct {
@@ -90,18 +91,18 @@ func (t *sqlTable) InsertMany(items []Map) []Map {
 		return out
 	}
 	out := make([]Map, 0, len(items))
-	err := t.base.Tx(func(db DataBase) error {
+	res := t.base.Tx(func(db DataBase) Res {
 		tb := db.Table(t.name)
 		for _, item := range items {
 			one := tb.Insert(item)
 			if db.Error() != nil {
-				return wrapErr(t.name+".insertMany.item", ErrInvalidUpdate, db.Error())
+				return txErrorResult(wrapErr(t.name+".insertMany.item", ErrInvalidUpdate, db.Error()))
 			}
 			out = append(out, one)
 		}
-		return nil
+		return infra.OK
 	})
-	t.base.setError(wrapErr(t.name+".insertMany", ErrInvalidUpdate, err))
+	t.base.setError(wrapErr(t.name+".insertMany", ErrInvalidUpdate, txResultError(res)))
 	return out
 }
 
@@ -251,18 +252,18 @@ func (t *sqlTable) UpsertMany(items []Map, args ...Any) []Map {
 		return []Map{}
 	}
 	out := make([]Map, 0, len(items))
-	err := t.base.Tx(func(db DataBase) error {
+	res := t.base.Tx(func(db DataBase) Res {
 		tb := db.Table(t.name)
 		for _, item := range items {
 			one := tb.Upsert(item, args...)
 			if db.Error() != nil {
-				return wrapErr(t.name+".upsertMany.item", ErrInvalidUpdate, db.Error())
+				return txErrorResult(wrapErr(t.name+".upsertMany.item", ErrInvalidUpdate, db.Error()))
 			}
 			out = append(out, one)
 		}
-		return nil
+		return infra.OK
 	})
-	t.base.setError(wrapErr(t.name+".upsertMany", ErrInvalidUpdate, err))
+	t.base.setError(wrapErr(t.name+".upsertMany", ErrInvalidUpdate, txResultError(res)))
 	return out
 }
 
@@ -452,12 +453,12 @@ func (t *sqlTable) Remove(args ...Any) Map {
 	}
 	if t.base.tx == nil {
 		var out Map
-		err := t.base.Tx(func(db DataBase) error {
+		res := t.base.Tx(func(db DataBase) Res {
 			tb := db.Table(t.name).(*sqlTable)
 			out = tb.Remove(args...)
-			return db.Error()
+			return txErrorResult(db.Error())
 		})
-		t.base.setError(err)
+		t.base.setError(txResultError(res))
 		return out
 	}
 
@@ -489,12 +490,12 @@ func (t *sqlTable) RemoveMany(args ...Any) int64 {
 	}
 	if t.base.tx == nil {
 		var affected int64
-		err := t.base.Tx(func(db DataBase) error {
+		res := t.base.Tx(func(db DataBase) Res {
 			tb := db.Table(t.name).(*sqlTable)
 			affected = tb.RemoveMany(args...)
-			return db.Error()
+			return txErrorResult(db.Error())
 		})
-		t.base.setError(err)
+		t.base.setError(txResultError(res))
 		return affected
 	}
 
@@ -531,12 +532,12 @@ func (t *sqlTable) Restore(args ...Any) Map {
 	}
 	if t.base.tx == nil {
 		var out Map
-		err := t.base.Tx(func(db DataBase) error {
+		res := t.base.Tx(func(db DataBase) Res {
 			tb := db.Table(t.name).(*sqlTable)
 			out = tb.Restore(args...)
-			return db.Error()
+			return txErrorResult(db.Error())
 		})
-		t.base.setError(err)
+		t.base.setError(txResultError(res))
 		return out
 	}
 
@@ -568,12 +569,12 @@ func (t *sqlTable) RestoreMany(args ...Any) int64 {
 	}
 	if t.base.tx == nil {
 		var affected int64
-		err := t.base.Tx(func(db DataBase) error {
+		res := t.base.Tx(func(db DataBase) Res {
 			tb := db.Table(t.name).(*sqlTable)
 			affected = tb.RestoreMany(args...)
-			return db.Error()
+			return txErrorResult(db.Error())
 		})
-		t.base.setError(err)
+		t.base.setError(txResultError(res))
 		return affected
 	}
 
@@ -1557,22 +1558,22 @@ func (t *sqlTable) updateByEntityLoop(sets Map, q Query) (int64, error) {
 		return 0, nil
 	}
 	affected := int64(0)
-	err = t.base.Tx(func(db DataBase) error {
+	res := t.base.Tx(func(db DataBase) Res {
 		tb := db.Table(t.name)
 		for _, item := range items {
 			sqltb, ok := tb.(*sqlTable)
 			if !ok {
-				return wrapErr(t.name+".update.loop.table", ErrInvalidUpdate, fmt.Errorf("invalid table type %T", tb))
+				return txErrorResult(wrapErr(t.name+".update.loop.table", ErrInvalidUpdate, fmt.Errorf("invalid table type %T", tb)))
 			}
 			_ = sqltb.updateEntity(item, sets)
 			if db.Error() != nil {
-				return db.Error()
+				return txErrorResult(db.Error())
 			}
 			affected++
 		}
-		return nil
+		return infra.OK
 	})
-	return affected, err
+	return affected, txResultError(res)
 }
 
 func (t *sqlTable) withAutoUpdateStamp(input Map) Map {

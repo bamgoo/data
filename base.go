@@ -23,7 +23,7 @@ import (
 
 type (
 	ScanFunc func(Map) Res
-	TxFunc   func(DataBase) error
+	TxFunc   func(DataBase) Res
 
 	MigrateOptions struct {
 		Startup     string
@@ -66,8 +66,8 @@ type (
 		Begin() error
 		Commit() error
 		Rollback() error
-		Tx(TxFunc) error
-		TxReadOnly(TxFunc) error
+		Tx(TxFunc) Res
+		TxReadOnly(TxFunc) Res
 		Migrate(...string)
 		MigratePlan(...string) MigrateReport
 		MigrateDiff(...string) MigrateReport
@@ -364,6 +364,33 @@ func (b *sqlBase) watcherKeysEnabled() bool {
 	return false
 }
 
+func txNormalizeResult(res Res) Res {
+	if res == nil {
+		return infra.OK
+	}
+	return res
+}
+
+func txErrorResult(err error) Res {
+	if err == nil {
+		return infra.OK
+	}
+	if res, ok := err.(Res); ok {
+		return res
+	}
+	return infra.Fail.With(err.Error())
+}
+
+func txResultError(res Res) error {
+	if res == nil || res.OK() {
+		return nil
+	}
+	if err, ok := any(res).(error); ok {
+		return err
+	}
+	return errors.New(res.Error())
+}
+
 func (b *sqlBase) Begin() error {
 	return b.beginTx(false)
 }
@@ -422,46 +449,70 @@ func (b *sqlBase) Rollback() error {
 	return nil
 }
 
-func (b *sqlBase) Tx(fn TxFunc) error {
+func (b *sqlBase) Tx(fn TxFunc) Res {
 	if fn == nil {
-		return nil
-	}
-	if err := b.beginTx(false); err != nil {
-		return wrapErr("tx.begin", ErrTxFailed, err)
-	}
-	if err := fn(b); err != nil {
-		_ = b.Rollback()
-		return wrapErr("tx.run", ErrTxFailed, err)
-	}
-	if err := b.Commit(); err != nil {
-		_ = b.Rollback()
-		return wrapErr("tx.commit", ErrTxFailed, err)
-	}
-	return nil
-}
-
-func (b *sqlBase) TxReadOnly(fn TxFunc) error {
-	if fn == nil {
-		return nil
+		return infra.OK
 	}
 	if b.tx != nil {
-		if err := fn(b); err != nil {
-			return wrapErr("tx.readonly.run", ErrTxFailed, err)
+		res := txNormalizeResult(fn(b))
+		if res.Fail() {
+			return res
 		}
-		return b.Error()
+		if err := b.Error(); err != nil {
+			return txErrorResult(wrapErr("tx.run", ErrTxFailed, err))
+		}
+		return infra.OK
 	}
-	if err := b.beginTx(true); err != nil {
-		return wrapErr("tx.readonly.begin", ErrTxFailed, err)
+	if err := b.beginTx(false); err != nil {
+		return txErrorResult(wrapErr("tx.begin", ErrTxFailed, err))
 	}
-	if err := fn(b); err != nil {
+	res := txNormalizeResult(fn(b))
+	if res.Fail() {
 		_ = b.Rollback()
-		return wrapErr("tx.readonly.run", ErrTxFailed, err)
+		return res
+	}
+	if err := b.Error(); err != nil {
+		_ = b.Rollback()
+		return txErrorResult(wrapErr("tx.run", ErrTxFailed, err))
 	}
 	if err := b.Commit(); err != nil {
 		_ = b.Rollback()
-		return wrapErr("tx.readonly.commit", ErrTxFailed, err)
+		return txErrorResult(wrapErr("tx.commit", ErrTxFailed, err))
 	}
-	return nil
+	return infra.OK
+}
+
+func (b *sqlBase) TxReadOnly(fn TxFunc) Res {
+	if fn == nil {
+		return infra.OK
+	}
+	if b.tx != nil {
+		res := txNormalizeResult(fn(b))
+		if res.Fail() {
+			return res
+		}
+		if err := b.Error(); err != nil {
+			return txErrorResult(wrapErr("tx.readonly.run", ErrTxFailed, err))
+		}
+		return infra.OK
+	}
+	if err := b.beginTx(true); err != nil {
+		return txErrorResult(wrapErr("tx.readonly.begin", ErrTxFailed, err))
+	}
+	res := txNormalizeResult(fn(b))
+	if res.Fail() {
+		_ = b.Rollback()
+		return res
+	}
+	if err := b.Error(); err != nil {
+		_ = b.Rollback()
+		return txErrorResult(wrapErr("tx.readonly.run", ErrTxFailed, err))
+	}
+	if err := b.Commit(); err != nil {
+		_ = b.Rollback()
+		return txErrorResult(wrapErr("tx.readonly.commit", ErrTxFailed, err))
+	}
+	return infra.OK
 }
 
 func (b *sqlBase) Capabilities() Capabilities {
@@ -2033,7 +2084,8 @@ func (b *sqlBase) runVersionedUp(versions ...string) error {
 			return fmt.Errorf("migration up not defined: %s", mg.Version)
 		}
 		start := time.Now()
-		if err := b.Tx(func(tx DataBase) error { return mg.Up(tx) }); err != nil {
+		if res := b.Tx(func(tx DataBase) Res { return txErrorResult(mg.Up(tx)) }); res.Fail() {
+			err := txResultError(res)
 			b.logMigrationEvent("version_up", mg.Version, mg.Name, false, time.Since(start), err)
 			return err
 		}
@@ -2103,7 +2155,8 @@ func (b *sqlBase) runVersionedDown(steps int) error {
 			return fmt.Errorf("migration down not defined: %s", v)
 		}
 		start := time.Now()
-		if err := b.Tx(func(tx DataBase) error { return mg.Down(tx) }); err != nil {
+		if res := b.Tx(func(tx DataBase) Res { return txErrorResult(mg.Down(tx)) }); res.Fail() {
+			err := txResultError(res)
 			b.logMigrationEvent("version_down", mg.Version, mg.Name, false, time.Since(start), err)
 			return err
 		}
@@ -2398,8 +2451,8 @@ func (b *invalidDataBase) WithTimeout(time.Duration) DataBase { return b }
 func (b *invalidDataBase) Begin() error                       { return b.err }
 func (b *invalidDataBase) Commit() error                      { return b.err }
 func (b *invalidDataBase) Rollback() error                    { return b.err }
-func (b *invalidDataBase) Tx(TxFunc) error                    { return b.err }
-func (b *invalidDataBase) TxReadOnly(TxFunc) error            { return b.err }
+func (b *invalidDataBase) Tx(TxFunc) Res                      { return txErrorResult(b.err) }
+func (b *invalidDataBase) TxReadOnly(TxFunc) Res              { return txErrorResult(b.err) }
 func (b *invalidDataBase) Migrate(...string)                  {}
 func (b *invalidDataBase) MigratePlan(...string) MigrateReport {
 	return MigrateReport{}
