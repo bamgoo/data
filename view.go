@@ -641,6 +641,7 @@ func (v *sqlView) bindBuilder(builder *SQLBuilder, q Query) {
 		return v.isKnownAlias(name, q)
 	}
 	builder.isJSONField = v.isJSONField
+	builder.isArrayField = v.isArrayField
 	builder.toStorage = v.base.storageField
 }
 
@@ -723,6 +724,38 @@ func (v *sqlView) isJSONField(name string) bool {
 		t := strings.ToLower(strings.TrimSpace(cfg.Type))
 		if t == "json" || t == "jsonb" || strings.HasPrefix(t, "map") {
 			return true
+		}
+	}
+	return false
+}
+
+func (v *sqlView) isArrayField(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	candidates := []string{name}
+	if v.base.fieldMappingEnabled() {
+		candidates = append(candidates, v.base.appField(name), v.base.storageField(name))
+	}
+	for _, one := range candidates {
+		cfg, ok := v.fields[one]
+		if !ok {
+			continue
+		}
+		t := strings.ToLower(strings.TrimSpace(cfg.Type))
+		if strings.HasPrefix(t, "[") || strings.HasPrefix(t, "array") {
+			return true
+		}
+		if cfg.Setting == nil {
+			continue
+		}
+		for _, key := range []string{"array", "multiple"} {
+			if raw, ok := cfg.Setting[key]; ok {
+				if on, yes := parseBool(raw); yes && on {
+					return true
+				}
+			}
 		}
 	}
 	return false

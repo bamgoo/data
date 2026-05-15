@@ -14,9 +14,10 @@ type SQLBuilder struct {
 	index   int
 	// Optional resolvers for `a.b` ambiguity:
 	// alias.field vs jsonPath.
-	isAlias     func(string) bool
-	isJSONField func(string) bool
-	toStorage   func(string) string
+	isAlias      func(string) bool
+	isJSONField  func(string) bool
+	isArrayField func(string) bool
+	toStorage    func(string) string
 }
 
 func NewSQLBuilder(d Dialect) *SQLBuilder {
@@ -189,11 +190,11 @@ func (b *SQLBuilder) compileCmp(c CmpExpr) (string, error) {
 		}
 		return "LOWER(" + field + ") LIKE LOWER(" + b.bind(val) + ")", nil
 	case OpContains:
-		return b.compileContains(field, c.Value)
+		return b.compileContains(c.Field, field, c.Value)
 	case OpOverlap:
 		return b.compileOverlap(field, c.Value)
 	case OpElemMatch:
-		return b.compileElemMatch(field, c.Value)
+		return b.compileElemMatch(c.Field, field, c.Value)
 	default:
 		return "", fmt.Errorf("unsupported compare operator %s", c.Op)
 	}
@@ -243,10 +244,13 @@ func (b *SQLBuilder) compileJSONPathExpr(head string, path []string) (string, er
 	}
 }
 
-func (b *SQLBuilder) compileContains(field string, value Any) (string, error) {
+func (b *SQLBuilder) compileContains(logicalField, field string, value Any) (string, error) {
 	name := strings.ToLower(b.dialect.Name())
 	switch name {
 	case "pgsql", "postgres":
+		if b.isArrayField != nil && b.isArrayField(logicalField) {
+			return field + " @> " + b.bind(pgArrayLiteral(value)), nil
+		}
 		raw, err := jsonString(value)
 		if err != nil {
 			return "", err
@@ -288,10 +292,13 @@ func (b *SQLBuilder) compileOverlap(field string, value Any) (string, error) {
 	}
 }
 
-func (b *SQLBuilder) compileElemMatch(field string, value Any) (string, error) {
+func (b *SQLBuilder) compileElemMatch(logicalField, field string, value Any) (string, error) {
 	name := strings.ToLower(b.dialect.Name())
 	switch name {
 	case "pgsql", "postgres":
+		if b.isArrayField != nil && b.isArrayField(logicalField) {
+			return field + " @> " + b.bind(pgArrayLiteral(value)), nil
+		}
 		arr := []Any{value}
 		raw, err := jsonString(arr)
 		if err != nil {
